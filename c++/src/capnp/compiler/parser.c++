@@ -20,7 +20,7 @@
 // THE SOFTWARE.
 
 #include "parser.h"
-#include "md5.h"
+#include "type-id.h"
 #include <capnp/dynamic.h>
 #include <kj/debug.h>
 #if !_MSC_VER
@@ -61,81 +61,6 @@ uint64_t generateRandomId() {
   return result | (1ull << 63);
 }
 
-uint64_t generateChildId(uint64_t parentId, kj::StringPtr childName) {
-  // Compute ID by MD5 hashing the concatenation of the parent ID and the declaration name, and
-  // then taking the first 8 bytes.
-
-  kj::byte parentIdBytes[sizeof(uint64_t)];
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    parentIdBytes[i] = (parentId >> (i * 8)) & 0xff;
-  }
-
-  Md5 md5;
-  md5.update(kj::arrayPtr(parentIdBytes, kj::size(parentIdBytes)));
-  md5.update(childName);
-
-  kj::ArrayPtr<const kj::byte> resultBytes = md5.finish();
-
-  uint64_t result = 0;
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    result = (result << 8) | resultBytes[i];
-  }
-
-  return result | (1ull << 63);
-}
-
-uint64_t generateGroupId(uint64_t parentId, uint16_t groupIndex) {
-  // Compute ID by MD5 hashing the concatenation of the parent ID and the group index, and
-  // then taking the first 8 bytes.
-
-  kj::byte bytes[sizeof(uint64_t) + sizeof(uint16_t)];
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    bytes[i] = (parentId >> (i * 8)) & 0xff;
-  }
-  for (uint i = 0; i < sizeof(uint16_t); i++) {
-    bytes[sizeof(uint64_t) + i] = (groupIndex >> (i * 8)) & 0xff;
-  }
-
-  Md5 md5;
-  md5.update(bytes);
-
-  kj::ArrayPtr<const kj::byte> resultBytes = md5.finish();
-
-  uint64_t result = 0;
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    result = (result << 8) | resultBytes[i];
-  }
-
-  return result | (1ull << 63);
-}
-
-uint64_t generateMethodParamsId(uint64_t parentId, uint16_t methodOrdinal, bool isResults) {
-  // Compute ID by MD5 hashing the concatenation of the parent ID, the method ordinal, and a
-  // boolean indicating whether this is the params or the results, and then taking the first 8
-  // bytes.
-
-  kj::byte bytes[sizeof(uint64_t) + sizeof(uint16_t) + 1];
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    bytes[i] = (parentId >> (i * 8)) & 0xff;
-  }
-  for (uint i = 0; i < sizeof(uint16_t); i++) {
-    bytes[sizeof(uint64_t) + i] = (methodOrdinal >> (i * 8)) & 0xff;
-  }
-  bytes[sizeof(bytes) - 1] = isResults;
-
-  Md5 md5;
-  md5.update(bytes);
-
-  kj::ArrayPtr<const kj::byte> resultBytes = md5.finish();
-
-  uint64_t result = 0;
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    result = (result << 8) | resultBytes[i];
-  }
-
-  return result | (1ull << 63);
-}
-
 void parseFile(List<Statement>::Reader statements, ParsedFile::Builder result,
                ErrorReporter& errorReporter) {
   CapnpParser parser(Orphanage::getForMessageContaining(result), errorReporter);
@@ -172,11 +97,17 @@ void parseFile(List<Statement>::Reader statements, ParsedFile::Builder result,
   }
 
   if (fileDecl.getId().which() != Declaration::Id::UID) {
+    // We didn't see an ID. Generate one randomly for now.
     uint64_t id = generateRandomId();
     fileDecl.getId().initUid().setValue(id);
-    errorReporter.addError(0, 0,
-        kj::str("File does not declare an ID.  I've generated one for you.  Add this line to your "
-                "file: @0x", kj::hex(id), ";"));
+
+    // Don't report missing ID if there was a parse error, because quite often the parse error
+    // prevents us from parsing the ID even though it is actually there.
+    if (!errorReporter.hadErrors()) {
+      errorReporter.addError(0, 0,
+          kj::str("File does not declare an ID.  I've generated one for you.  Add this line to "
+                  "your file: @0x", kj::hex(id), ";"));
+    }
   }
 
   auto declsBuilder = fileDecl.initNestedDecls(decls.size());
@@ -599,7 +530,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
                     builder.initApplication().adoptParams(kj::mv(params.value));
                     return result;
                   })))),
-      [this](Orphan<Expression>&& base, kj::Array<Orphan<Expression>>&& suffixes)
+      [](Orphan<Expression>&& base, kj::Array<Orphan<Expression>>&& suffixes)
           -> Orphan<Expression> {
         // Apply all the suffixes to the base expression.
         uint startByte = base.getReader().getStartByte();
@@ -773,7 +704,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
   // Parse an ordinal followed by an optional colon, or no ordinal but require a colon.
   auto& ordinalOrColon = arena.copy(p::oneOf(
       p::transform(p::sequence(parsers.ordinal, p::optional(op("!")), p::optional(op(":"))),
-          [this](Orphan<LocatedInteger>&& ordinal,
+          [](Orphan<LocatedInteger>&& ordinal,
                  kj::Maybe<kj::Tuple<>> exclamation,
                  kj::Maybe<kj::Tuple<>> colon)
                    -> kj::Tuple<kj::Maybe<Orphan<LocatedInteger>>, bool, bool> {
@@ -966,7 +897,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
   auto& annotationTarget = arena.copy(p::oneOf(
       identifier,
       p::transformWithLocation(op("*"),
-          [this](kj::parse::Span<List<Token>::Reader::Iterator> location) {
+          [](kj::parse::Span<List<Token>::Reader::Iterator> location) {
             // Hacky...
             return Located<Text::Reader>("*",
                 location.begin()->getStartByte(),

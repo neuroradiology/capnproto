@@ -24,6 +24,7 @@
 
 #if _WIN32
 #include <windows.h>
+#include "windows-sanity.h"
 #else
 #include <pthread.h>
 #include <signal.h>
@@ -35,15 +36,22 @@ namespace kj {
 
 Thread::Thread(Function<void()> func): state(new ThreadState { kj::mv(func), nullptr, 2 }) {
   threadHandle = CreateThread(nullptr, 0, &runThread, state, 0, nullptr);
-  KJ_ASSERT(threadHandle != nullptr, "CreateThread failed.");
+  if (threadHandle == nullptr) {
+    state->unref();
+    KJ_FAIL_ASSERT("CreateThread failed.");
+  }
 }
 
 Thread::~Thread() noexcept(false) {
   if (!detached) {
+    KJ_DEFER(state->unref());
+
     KJ_ASSERT(WaitForSingleObject(threadHandle, INFINITE) != WAIT_FAILED);
 
-    KJ_IF_MAYBE(e, exception) {
-      kj::throwRecoverableException(kj::mv(*e));
+    KJ_IF_MAYBE(e, state->exception) {
+      Exception ecopy = kj::mv(*e);
+      state->exception = nullptr;  // don't complain of uncaught exception when deleting
+      kj::throwRecoverableException(kj::mv(ecopy));
     }
   }
 }
@@ -73,6 +81,7 @@ Thread::Thread(Function<void()> func): state(new ThreadState { kj::mv(func), nul
   int pthreadResult = pthread_create(reinterpret_cast<pthread_t*>(&threadId),
                                      nullptr, &runThread, state);
   if (pthreadResult != 0) {
+    state->unref();
     KJ_FAIL_SYSCALL("pthread_create", pthreadResult);
   }
 }
@@ -125,8 +134,7 @@ void* Thread::runThread(void* ptr) {
 
 void Thread::ThreadState::unref() {
 #if _MSC_VER
-  if (_InterlockedDecrement_rel(&refcount)) {
-    _ReadBarrier();
+  if (_InterlockedDecrement(&refcount) == 0) {
 #else
   if (__atomic_sub_fetch(&refcount, 1, __ATOMIC_RELEASE) == 0) {
     __atomic_thread_fence(__ATOMIC_ACQUIRE);

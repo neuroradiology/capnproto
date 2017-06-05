@@ -177,6 +177,11 @@ public:
   inline T& front() { return *ptr; }
   inline T& back() { return *(ptr + size_ - 1); }
 
+  template <typename U>
+  inline bool operator==(const U& other) const { return asPtr() == other; }
+  template <typename U>
+  inline bool operator!=(const U& other) const { return asPtr() != other; }
+
   inline ArrayPtr<T> slice(size_t start, size_t end) {
     KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().");
     return ArrayPtr<T>(ptr + start, end - start);
@@ -249,7 +254,11 @@ private:
 
   template <typename U>
   friend class Array;
+  template <typename U>
+  friend class ArrayBuilder;
 };
+
+static_assert(!canMemcpy<Array<char>>(), "canMemcpy<>() is broken");
 
 namespace _ {  // private
 
@@ -294,7 +303,7 @@ template <typename T> Array<T> heapArray(std::initializer_list<T> init);
 // Allocate a heap array containing a copy of the given content.
 
 template <typename T, typename Container>
-Array<T> heapArrayFromIterable(Container&& a) { return heapArray(a.begin(), a.end()); }
+Array<T> heapArrayFromIterable(Container&& a) { return heapArray<T>(a.begin(), a.end()); }
 template <typename T>
 Array<T> heapArrayFromIterable(Array<T>&& a) { return mv(a); }
 
@@ -318,6 +327,13 @@ public:
     other.ptr = nullptr;
     other.pos = nullptr;
     other.endPtr = nullptr;
+  }
+  ArrayBuilder(Array<T>&& other)
+      : ptr(other.ptr), pos(other.ptr + other.size_), endPtr(pos), disposer(other.disposer) {
+    // Create an already-full ArrayBuilder from an Array of the same type. This constructor
+    // primarily exists to enable Vector<T> to be constructed from Array<T>.
+    other.ptr = nullptr;
+    other.size_ = 0;
   }
   KJ_DISALLOW_COPY(ArrayBuilder);
   inline ~ArrayBuilder() noexcept(false) { dispose(); }
@@ -376,15 +392,54 @@ public:
 
   template <typename Container>
   void addAll(Container&& container) {
-    addAll(container.begin(), container.end());
+    addAll<decltype(container.begin()), !isReference<Container>()>(
+        container.begin(), container.end());
   }
 
-  template <typename Iterator>
+  template <typename Iterator, bool move = false>
   void addAll(Iterator start, Iterator end);
 
   void removeLast() {
     KJ_IREQUIRE(pos > ptr, "No elements present to remove.");
     kj::dtor(*--pos);
+  }
+
+  void truncate(size_t size) {
+    KJ_IREQUIRE(size <= this->size(), "can't use truncate() to expand");
+
+    T* target = ptr + size;
+    if (__has_trivial_destructor(T)) {
+      pos = target;
+    } else {
+      while (pos > target) {
+        kj::dtor(*--pos);
+      }
+    }
+  }
+
+  void resize(size_t size) {
+    KJ_IREQUIRE(size <= capacity(), "can't resize past capacity");
+
+    T* target = ptr + size;
+    if (target > pos) {
+      // expand
+      if (__has_trivial_constructor(T)) {
+        pos = target;
+      } else {
+        while (pos < target) {
+          kj::ctor(*pos++);
+        }
+      }
+    } else {
+      // truncate
+      if (__has_trivial_destructor(T)) {
+        pos = target;
+      } else {
+        while (pos > target) {
+          kj::dtor(*--pos);
+        }
+      }
+    }
   }
 
   Array<T> finish() {
@@ -501,7 +556,8 @@ private:
 // KJ_MAP
 
 #define KJ_MAP(elementName, array) \
-  ::kj::_::Mapper<KJ_DECLTYPE_REF(array)>(array) * [&](decltype(*(array).begin()) elementName)
+  ::kj::_::Mapper<KJ_DECLTYPE_REF(array)>(array) * \
+  [&](typename ::kj::_::Mapper<KJ_DECLTYPE_REF(array)>::Element elementName)
 // Applies some function to every element of an array, returning an Array of the results,  with
 // nice syntax.  Example:
 //
@@ -523,6 +579,22 @@ struct Mapper {
     }
     return builder.finish();
   }
+  typedef decltype(*kj::instance<T>().begin()) Element;
+};
+
+template <typename T, size_t s>
+struct Mapper<T(&)[s]> {
+  T* array;
+  Mapper(T* array): array(array) {}
+  template <typename Func>
+  auto operator*(Func&& func) -> Array<decltype(func(*array))> {
+    auto builder = heapArrayBuilder<decltype(func(*array))>(s);
+    for (size_t i = 0; i < s; i++) {
+      builder.add(func(array[i]));
+    }
+    return builder.finish();
+  }
+  typedef decltype(*array)& Element;
 };
 
 }  // namespace _ (private)
@@ -598,11 +670,11 @@ T* HeapArrayDisposer::allocateUninitialized(size_t count) {
   return Allocate_<T, true, true>::allocate(0, count);
 }
 
-template <typename Element, typename Iterator, bool = canMemcpy<Element>()>
+template <typename Element, typename Iterator, bool move, bool = canMemcpy<Element>()>
 struct CopyConstructArray_;
 
-template <typename T>
-struct CopyConstructArray_<T, T*, true> {
+template <typename T, bool move>
+struct CopyConstructArray_<T, T*, move, true> {
   static inline T* apply(T* __restrict__ pos, T* start, T* end) {
     memcpy(pos, start, reinterpret_cast<byte*>(end) - reinterpret_cast<byte*>(start));
     return pos + (end - start);
@@ -610,15 +682,15 @@ struct CopyConstructArray_<T, T*, true> {
 };
 
 template <typename T>
-struct CopyConstructArray_<T, const T*, true> {
+struct CopyConstructArray_<T, const T*, false, true> {
   static inline T* apply(T* __restrict__ pos, const T* start, const T* end) {
     memcpy(pos, start, reinterpret_cast<const byte*>(end) - reinterpret_cast<const byte*>(start));
     return pos + (end - start);
   }
 };
 
-template <typename T, typename Iterator>
-struct CopyConstructArray_<T, Iterator, true> {
+template <typename T, typename Iterator, bool move>
+struct CopyConstructArray_<T, Iterator, move, true> {
   static inline T* apply(T* __restrict__ pos, Iterator start, Iterator end) {
     // Since both the copy constructor and assignment operator are trivial, we know that assignment
     // is equivalent to copy-constructing.  So we can make this case somewhat easier for the
@@ -631,7 +703,7 @@ struct CopyConstructArray_<T, Iterator, true> {
 };
 
 template <typename T, typename Iterator>
-struct CopyConstructArray_<T, Iterator, false> {
+struct CopyConstructArray_<T, Iterator, false, false> {
   struct ExceptionGuard {
     T* start;
     T* pos;
@@ -666,16 +738,48 @@ struct CopyConstructArray_<T, Iterator, false> {
 };
 
 template <typename T, typename Iterator>
-inline T* copyConstructArray(T* dst, Iterator start, Iterator end) {
-  return CopyConstructArray_<T, Decay<Iterator>>::apply(dst, start, end);
-}
+struct CopyConstructArray_<T, Iterator, true, false> {
+  // Actually move-construct.
+
+  struct ExceptionGuard {
+    T* start;
+    T* pos;
+    inline explicit ExceptionGuard(T* pos): start(pos), pos(pos) {}
+    ~ExceptionGuard() noexcept(false) {
+      while (pos > start) {
+        dtor(*--pos);
+      }
+    }
+  };
+
+  static T* apply(T* __restrict__ pos, Iterator start, Iterator end) {
+    // Verify that T can be *implicitly* constructed from the source values.
+    if (false) implicitCast<T>(kj::mv(*start));
+
+    if (noexcept(T(kj::mv(*start)))) {
+      while (start != end) {
+        ctor(*pos++, kj::mv(*start++));
+      }
+      return pos;
+    } else {
+      // Crap.  This is complicated.
+      ExceptionGuard guard(pos);
+      while (start != end) {
+        ctor(*guard.pos, kj::mv(*start++));
+        ++guard.pos;
+      }
+      guard.start = guard.pos;
+      return guard.pos;
+    }
+  }
+};
 
 }  // namespace _ (private)
 
 template <typename T>
-template <typename Iterator>
+template <typename Iterator, bool move>
 void ArrayBuilder<T>::addAll(Iterator start, Iterator end) {
-  pos = _::copyConstructArray(pos, start, end);
+  pos = _::CopyConstructArray_<RemoveConst<T>, Decay<Iterator>, move>::apply(pos, start, end);
 }
 
 template <typename T>
@@ -717,6 +821,15 @@ template <typename T>
 inline Array<T> heapArray(std::initializer_list<T> init) {
   return heapArray<T>(init.begin(), init.end());
 }
+
+#if __cplusplus > 201402L
+template <typename T, typename... Params>
+inline Array<Decay<T>> arr(T&& param1, Params&&... params) {
+  ArrayBuilder<Decay<T>> builder = heapArrayBuilder<Decay<T>>(sizeof...(params) + 1);
+  (builder.add(kj::fwd<T>(param1)), ... , builder.add(kj::fwd<Params>(params)));
+  return builder.finish();
+}
+#endif
 
 }  // namespace kj
 

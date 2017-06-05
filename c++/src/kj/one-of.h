@@ -74,11 +74,27 @@ public:
   }
 
   template <typename T, typename... Params>
-  void init(Params&&... params) {
+  T& init(Params&&... params) {
     if (tag != 0) destroy();
     ctor(*reinterpret_cast<T*>(space), kj::fwd<Params>(params)...);
     tag = typeIndex<T>();
+    return *reinterpret_cast<T*>(space);
   }
+
+  template <typename T>
+  Maybe<T&> tryGet() {
+    if (is<T>()) {
+      return *reinterpret_cast<T*>(space);
+    } else {
+      return nullptr;
+    }
+  }
+
+  template <uint i>
+  KJ_NORETURN(void allHandled());
+  // After a series of if/else blocks handling each variant of the OneOf, have the final else
+  // block call allHandled<n>() where n is the number of variants. This will fail to compile
+  // if new variants are added in the future.
 
 private:
   uint tag;
@@ -94,8 +110,12 @@ private:
   // TODO(someday):  Generalize the above template and make it common.  I tried, but C++ decided to
   //   be difficult so I cut my losses.
 
+  static constexpr auto spaceSize = maxSize(sizeof(Variants)...);
+  // TODO(msvc):  This constant could just as well go directly inside space's bracket's, where it's
+  // used, but MSVC suffers a parse error on `...`.
+
   union {
-    byte space[maxSize(sizeof(Variants)...)];
+    byte space[spaceSize];
 
     void* forceAligned;
     // TODO(someday):  Use C++11 alignas() once we require GCC 4.8 / Clang 3.3.
@@ -144,6 +164,17 @@ private:
     doAll(moveVariantFrom<Variants>(other)...);
   }
 };
+
+template <typename... Variants>
+template <uint i>
+void OneOf<Variants...>::allHandled() {
+  // After a series of if/else blocks handling each variant of the OneOf, have the final else
+  // block call allHandled<n>() where n is the number of variants. This will fail to compile
+  // if new variants are added in the future.
+
+  static_assert(i == sizeof...(Variants), "new OneOf variants need to be handled here");
+  KJ_UNREACHABLE;
+}
 
 }  // namespace kj
 

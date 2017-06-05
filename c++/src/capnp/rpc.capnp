@@ -233,11 +233,11 @@ struct Message {
 
     abort @1 :Exception;
     # Sent when a connection is being aborted due to an unrecoverable error.  This could be e.g.
-    # because the sender received an invalid or nonsensical message (`isCallersFault` is true) or
-    # because the sender had an internal error (`isCallersFault` is false).  The sender will shut
-    # down the outgoing half of the connection after `abort` and will completely close the
-    # connection shortly thereafter (it's up to the sender how much of a time buffer they want to
-    # offer for the client to receive the `abort` before the connection is reset).
+    # because the sender received an invalid or nonsensical message or because the sender had an
+    # internal error.  The sender will shut down the outgoing half of the connection after `abort`
+    # and will completely close the connection shortly thereafter (it's up to the sender how much
+    # of a time buffer they want to offer for the client to receive the `abort` before the
+    # connection is reset).
 
     # Level 0 features -----------------------------------------------
 
@@ -1234,8 +1234,8 @@ using ProvisionId = AnyPointer;
 # The information that must be sent in an `Accept` message to identify the object being accepted.
 #
 # In a network where each vat has a public/private key pair, this could simply be the public key
-# fingerprint of the provider vat along with the question ID used in the `Provide` message sent from
-# that provider.
+# fingerprint of the provider vat along with a nonce matching the one in the `RecipientId` used
+# in the `Provide` message sent from that provider.
 
 using RecipientId = AnyPointer;
 # **(level 3)**
@@ -1244,8 +1244,7 @@ using RecipientId = AnyPointer;
 # capability.
 #
 # In a network where each vat has a public/private key pair, this could simply be the public key
-# fingerprint of the recipient.  (CapTP also calls for a nonce to identify the object.  In our
-# case, the `Provide` message's `questionId` can serve as the nonce.)
+# fingerprint of the recipient along with a nonce matching the one in the `ProvisionId`.
 
 using ThirdPartyCapId = AnyPointer;
 # **(level 3)**
@@ -1254,8 +1253,8 @@ using ThirdPartyCapId = AnyPointer;
 #
 # In a network where each vat has a public/private key pair, this could be a combination of the
 # third party's public key fingerprint, hints on how to connect to the third party (e.g. an IP
-# address), and the question ID used in the corresponding `Provide` message sent to that third party
-# (used to identify which capability to pick up).
+# address), and the nonce used in the corresponding `Provide` message's `RecipientId` as sent
+# to that third party (used to identify which capability to pick up).
 
 using JoinKeyPart = AnyPointer;
 # **(level 4)**

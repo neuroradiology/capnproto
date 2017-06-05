@@ -30,7 +30,6 @@
 #include <set>
 #include <unordered_map>
 #include "node-translator.h"
-#include "md5.h"
 
 namespace capnp {
 namespace compiler {
@@ -51,7 +50,7 @@ private:
   bool initialized = false;
 };
 
-class Compiler::Node: public NodeTranslator::Resolver {
+class Compiler::Node final: public NodeTranslator::Resolver {
   // Passes through four states:
   // - Stub:  On initial construction, the Node is just a placeholder object.  Its ID has been
   //     determined, and it is placed in its parent's member table as well as the compiler's
@@ -680,6 +679,11 @@ void Compiler::Node::traverse(uint eagerness, std::unordered_map<Node*, uint>& s
     KJ_IF_MAYBE(content, getContent(Content::EXPANDED)) {
       for (auto& child: content->orderedNestedNodes) {
         child->traverse(eagerness, seen, finalLoader);
+      }
+
+      // Also traverse `using` declarations.
+      for (auto& child: content->aliases) {
+        child.second->compile();
       }
     }
   }

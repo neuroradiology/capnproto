@@ -32,9 +32,6 @@
 
 namespace capnp {
 
-const _::RawBrandedSchema* const Capability::_capnpPrivate::brand =
-    &_::NULL_INTERFACE_SCHEMA.defaultBrand;
-
 namespace _ {
 
 void setGlobalBrokenCapFactoryForLayoutCpp(BrokenCapFactory& factory);
@@ -543,6 +540,10 @@ kj::Own<ClientHook> Capability::Client::makeLocalClient(kj::Own<Capability::Serv
 
 kj::Own<ClientHook> newLocalPromiseClient(kj::Promise<kj::Own<ClientHook>>&& promise) {
   return kj::refcounted<QueuedClient>(kj::mv(promise));
+}
+
+kj::Own<PipelineHook> newLocalPromisePipeline(kj::Promise<kj::Own<PipelineHook>>&& promise) {
+  return kj::refcounted<QueuedPipeline>(kj::mv(promise));
 }
 
 // =======================================================================================

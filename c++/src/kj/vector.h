@@ -43,6 +43,7 @@ class Vector {
 public:
   inline Vector() = default;
   inline explicit Vector(size_t capacity): builder(heapArrayBuilder<T>(capacity)) {}
+  inline Vector(Array<T>&& array): builder(kj::mv(array)) {}
 
   inline operator ArrayPtr<T>() { return builder; }
   inline operator ArrayPtr<const T>() const { return builder; }
@@ -71,6 +72,18 @@ public:
     return builder.finish();
   }
 
+  template <typename U>
+  inline bool operator==(const U& other) const { return asPtr() == other; }
+  template <typename U>
+  inline bool operator!=(const U& other) const { return asPtr() != other; }
+
+  inline ArrayPtr<T> slice(size_t start, size_t end) {
+    return asPtr().slice(start, end);
+  }
+  inline ArrayPtr<const T> slice(size_t start, size_t end) const {
+    return asPtr().slice(start, end);
+  }
+
   template <typename... Params>
   inline T& add(Params&&... params) {
     if (builder.isFull()) grow();
@@ -95,12 +108,7 @@ public:
 
   inline void resize(size_t size) {
     if (size > builder.capacity()) grow(size);
-    while (builder.size() < size) {
-      builder.add(T());
-    }
-    while (builder.size() > size) {
-      builder.removeLast();
-    }
+    builder.resize(size);
   }
 
   inline void operator=(decltype(nullptr)) {
@@ -114,8 +122,12 @@ public:
   }
 
   inline void truncate(size_t size) {
-    while (builder.size() > size) {
-      builder.removeLast();
+    builder.truncate(size);
+  }
+
+  inline void reserve(size_t size) {
+    if (size > builder.capacity()) {
+      setCapacity(size);
     }
   }
 
@@ -126,11 +138,11 @@ private:
     setCapacity(kj::max(minCapacity, capacity() == 0 ? 4 : capacity() * 2));
   }
   void setCapacity(size_t newSize) {
-    ArrayBuilder<T> newBuilder = heapArrayBuilder<T>(newSize);
-    size_t moveCount = kj::min(newSize, builder.size());
-    for (size_t i = 0; i < moveCount; i++) {
-      newBuilder.add(kj::mv(builder[i]));
+    if (builder.size() > newSize) {
+      builder.truncate(newSize);
     }
+    ArrayBuilder<T> newBuilder = heapArrayBuilder<T>(newSize);
+    newBuilder.addAll(kj::mv(builder));
     builder = kj::mv(newBuilder);
   }
 };

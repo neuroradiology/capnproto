@@ -22,12 +22,11 @@
 #include "dynamic.h"
 #include <kj/debug.h>
 #include <kj/vector.h>
+#include <kj/encoding.h>
 
 namespace capnp {
 
 namespace {
-
-static const char HEXDIGITS[] = "0123456789abcdef";
 
 enum PrintMode {
   BARE,
@@ -58,7 +57,8 @@ public:
     if (amount == 0 || canPrintAllInline(items, kind)) {
       return kj::StringTree(kj::mv(items), ", ");
     } else {
-      char delim[amount * 2 + 3];
+      KJ_STACK_ARRAY(char, delimArrayPtr, amount * 2 + 3, 32, 256);
+      auto delim = delimArrayPtr.begin();
       delim[0] = ',';
       delim[1] = '\n';
       memset(delim + 2, ' ', amount * 2);
@@ -149,34 +149,7 @@ static kj::StringTree print(const DynamicValue::Reader& value,
         chars = value.as<Text>();
       }
 
-      kj::Vector<char> escaped(chars.size());
-
-      for (char c: chars) {
-        switch (c) {
-          case '\a': escaped.addAll(kj::StringPtr("\\a")); break;
-          case '\b': escaped.addAll(kj::StringPtr("\\b")); break;
-          case '\f': escaped.addAll(kj::StringPtr("\\f")); break;
-          case '\n': escaped.addAll(kj::StringPtr("\\n")); break;
-          case '\r': escaped.addAll(kj::StringPtr("\\r")); break;
-          case '\t': escaped.addAll(kj::StringPtr("\\t")); break;
-          case '\v': escaped.addAll(kj::StringPtr("\\v")); break;
-          case '\'': escaped.addAll(kj::StringPtr("\\\'")); break;
-          case '\"': escaped.addAll(kj::StringPtr("\\\"")); break;
-          case '\\': escaped.addAll(kj::StringPtr("\\\\")); break;
-          default:
-            if (c < 0x20) {
-              escaped.add('\\');
-              escaped.add('x');
-              uint8_t c2 = c;
-              escaped.add(HEXDIGITS[c2 / 16]);
-              escaped.add(HEXDIGITS[c2 % 16]);
-            } else {
-              escaped.add(c);
-            }
-            break;
-        }
-      }
-      return kj::strTree('"', escaped, '"');
+      return kj::strTree('"', kj::encodeCEscape(chars), '"');
     }
     case DynamicValue::LIST: {
       auto listValue = value.as<DynamicList>();

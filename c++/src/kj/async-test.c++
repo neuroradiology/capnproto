@@ -26,9 +26,12 @@
 namespace kj {
 namespace {
 
+#if !_MSC_VER
+// TODO(msvc): GetFunctorStartAddress is not supported on MSVC currently, so skip the test.
 TEST(Async, GetFunctorStartAddress) {
   EXPECT_TRUE(nullptr != _::GetFunctorStartAddress<>::apply([](){return 0;}));
 }
+#endif
 
 TEST(Async, EvalVoid) {
   EventLoop loop;
@@ -167,7 +170,7 @@ TEST(Async, Chain) {
   Promise<int> promise2 = evalLater([&]() -> int { return 321; });
 
   auto promise3 = promise.then([&](int i) {
-    return promise2.then([&loop,i](int j) {
+    return promise2.then([i](int j) {
       return i + j;
     });
   });
@@ -357,11 +360,6 @@ TEST(Async, SeparateFulfillerChained) {
   EXPECT_EQ(123, pair.promise.wait(waitScope));
 }
 
-#if KJ_NO_EXCEPTIONS
-#undef EXPECT_ANY_THROW
-#define EXPECT_ANY_THROW(code) EXPECT_DEATH(code, ".")
-#endif
-
 TEST(Async, SeparateFulfillerDiscarded) {
   EventLoop loop;
   WaitScope waitScope(loop);
@@ -490,6 +488,21 @@ TEST(Async, ForkRef) {
 
   EXPECT_EQ(456, branch1.wait(waitScope));
   EXPECT_EQ(789, branch2.wait(waitScope));
+}
+
+TEST(Async, Split) {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  Promise<Tuple<int, String, Promise<int>>> promise = evalLater([&]() {
+    return kj::tuple(123, str("foo"), Promise<int>(321));
+  });
+
+  Tuple<Promise<int>, Promise<String>, Promise<int>> split = promise.split();
+
+  EXPECT_EQ(123, get<0>(split).wait(waitScope));
+  EXPECT_EQ("foo", get<1>(split).wait(waitScope));
+  EXPECT_EQ(321, get<2>(split).wait(waitScope));
 }
 
 TEST(Async, ExclusiveJoin) {

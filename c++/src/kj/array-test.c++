@@ -333,6 +333,16 @@ TEST(Array, Map) {
   EXPECT_STREQ("bcde", str(bar).cStr());
 }
 
+TEST(Array, MapRawArray) {
+  uint foo[4] = {1, 2, 3, 4};
+  Array<uint> bar = KJ_MAP(i, foo) -> uint { return i * i; };
+  ASSERT_EQ(4, bar.size());
+  EXPECT_EQ(1, bar[0]);
+  EXPECT_EQ(4, bar[1]);
+  EXPECT_EQ(9, bar[2]);
+  EXPECT_EQ(16, bar[3]);
+}
+
 TEST(Array, ReleaseAsBytesOrChars) {
   {
     Array<char> chars = kj::heapArray<char>("foo", 3);
@@ -367,6 +377,13 @@ TEST(Array, ReleaseAsBytesOrChars) {
     EXPECT_EQ('o', chars[2]);
   }
 }
+
+#if __cplusplus > 201402L
+KJ_TEST("kj::arr()") {
+  kj::Array<kj::String> array = kj::arr(kj::str("foo"), kj::str(123));
+  KJ_EXPECT(array == kj::ArrayPtr<const kj::StringPtr>({"foo", "123"}));
+}
+#endif
 
 }  // namespace
 }  // namespace kj
