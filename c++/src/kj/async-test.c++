@@ -620,6 +620,30 @@ TEST(Async, TaskSet) {
   EXPECT_EQ(1u, errorHandler.exceptionCount);
 }
 
+TEST(Async, TaskSetOnEmpty) {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+  ErrorHandlerImpl errorHandler;
+  TaskSet tasks(errorHandler);
+
+  KJ_EXPECT(tasks.isEmpty());
+
+  auto paf = newPromiseAndFulfiller<void>();
+  tasks.add(kj::mv(paf.promise));
+  tasks.add(evalLater([]() {}));
+
+  KJ_EXPECT(!tasks.isEmpty());
+
+  auto promise = tasks.onEmpty();
+  KJ_EXPECT(!promise.poll(waitScope));
+  KJ_EXPECT(!tasks.isEmpty());
+
+  paf.fulfiller->fulfill();
+  KJ_ASSERT(promise.poll(waitScope));
+  KJ_EXPECT(tasks.isEmpty());
+  promise.wait(waitScope);
+}
+
 class DestructorDetector {
 public:
   DestructorDetector(bool& setTrue): setTrue(setTrue) {}
@@ -746,6 +770,17 @@ TEST(Async, SetRunnable) {
 
     EXPECT_EQ(8, port.callCount);
   }
+}
+
+TEST(Async, Poll) {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  auto paf = newPromiseAndFulfiller<void>();
+  KJ_ASSERT(!paf.promise.poll(waitScope));
+  paf.fulfiller->fulfill();
+  KJ_ASSERT(paf.promise.poll(waitScope));
+  paf.promise.wait(waitScope);
 }
 
 }  // namespace

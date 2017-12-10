@@ -162,40 +162,31 @@ public:
   }
 
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
-    readQueue = readQueue.addBranch().then([this,buffer,minBytes,maxBytes](size_t) {
-      return tryReadInternal(buffer, minBytes, maxBytes, 0);
-    }).fork();
-    return readQueue.addBranch();
+    return tryReadInternal(buffer, minBytes, maxBytes, 0);
   }
 
   Promise<void> write(const void* buffer, size_t size) override {
-    writeQueue = writeQueue.addBranch().then([this,buffer,size]() {
-      return writeInternal(kj::arrayPtr(reinterpret_cast<const byte*>(buffer), size), nullptr);
-    }).fork();
-    return writeQueue.addBranch();
+    return writeInternal(kj::arrayPtr(reinterpret_cast<const byte*>(buffer), size), nullptr);
   }
 
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
-    if (pieces.size() > 0) {
-      writeQueue = writeQueue.addBranch().then([this,pieces]() {
-        return writeInternal(pieces[0], pieces.slice(1, pieces.size()));
-      }).fork();
-    }
-    return writeQueue.addBranch();
+    return writeInternal(pieces[0], pieces.slice(1, pieces.size()));
   }
 
   void shutdownWrite() override {
+    KJ_REQUIRE(shutdownTask == nullptr, "already called shutdownWrite()");
+
     // TODO(soon): shutdownWrite() is problematic because it doesn't return a promise. It was
     //   designed to assume that it would only be called after all writes are finished and that
     //   there was no reason to block at that point, but SSL sessions don't fit this since they
     //   actually have to send a shutdown message.
-    writeQueue = writeQueue.addBranch().then([this]() {
-      sslCall([this]() {
-        // The first SSL_shutdown() call is expected to return 0 and may flag a misleading error.
-        int result = SSL_shutdown(ssl);
-        return result == 0 ? 1 : result;
-      });
-    }).fork();
+    shutdownTask = sslCall([this]() {
+      // The first SSL_shutdown() call is expected to return 0 and may flag a misleading error.
+      int result = SSL_shutdown(ssl);
+      return result == 0 ? 1 : result;
+    }).ignoreResult().eagerlyEvaluate([](kj::Exception&& e) {
+      KJ_LOG(ERROR, e);
+    });
   }
 
   void abortRead() override {
@@ -222,8 +213,7 @@ private:
   kj::Own<kj::AsyncIoStream> ownInner;
 
   bool disconnected = false;
-  kj::ForkedPromise<size_t> readQueue = kj::Promise<size_t>(size_t(0)).fork();
-  kj::ForkedPromise<void> writeQueue = kj::Promise<void>(kj::READY_NOW).fork();
+  kj::Maybe<kj::Promise<void>> shutdownTask;
 
   ReadyInputStreamWrapper readBuffer;
   ReadyOutputStreamWrapper writeBuffer;
@@ -245,6 +235,8 @@ private:
 
   Promise<void> writeInternal(kj::ArrayPtr<const byte> first,
                               kj::ArrayPtr<const kj::ArrayPtr<const byte>> rest) {
+    KJ_REQUIRE(shutdownTask == nullptr, "already called shutdownWrite()");
+
     return sslCall([this,first]() { return SSL_write(ssl, first.begin(), first.size()); })
         .then([this,first,rest](size_t n) -> kj::Promise<void> {
       if (n < first.size()) {
@@ -284,8 +276,10 @@ private:
             disconnected = true;
             return size_t(0);
           } else {
-            KJ_FAIL_ASSERT(
-                "OpenSSL claims there was an I/O error but we shouldn't get here then...");
+            // According to documentation we shouldn't get here, because our BIO never returns an
+            // "error". But in practice we do get here sometimes when the peer disconnects
+            // prematurely.
+            KJ_FAIL_ASSERT("TLS protocol error");
           }
         default:
           KJ_FAIL_ASSERT("unexpected SSL error code", error);
@@ -441,6 +435,8 @@ private:
 class TlsNetwork: public kj::Network {
 public:
   TlsNetwork(TlsContext& tls, kj::Network& inner): tls(tls), inner(inner) {}
+  TlsNetwork(TlsContext& tls, kj::Own<kj::Network> inner)
+      : tls(tls), inner(*inner), ownInner(kj::mv(inner)) {}
 
   Promise<Own<NetworkAddress>> parseAddress(StringPtr addr, uint portHint) override {
     kj::String hostname;
@@ -461,9 +457,19 @@ public:
     KJ_UNIMPLEMENTED("TLS does not implement getSockaddr() because it needs to know hostnames");
   }
 
+  Own<Network> restrictPeers(
+      kj::ArrayPtr<const kj::StringPtr> allow,
+      kj::ArrayPtr<const kj::StringPtr> deny = nullptr) override {
+    // TODO(someday): Maybe we could implement the ability to specify CA or hostname restrictions?
+    //   Or is it better to let people do that via the TlsContext? A neat thing about
+    //   restrictPeers() is that it's easy to make user-configurable.
+    return kj::heap<TlsNetwork>(tls, inner.restrictPeers(allow, deny));
+  }
+
 private:
   TlsContext& tls;
   kj::Network& inner;
+  kj::Own<kj::Network> ownInner;
 };
 
 }  // namespace
@@ -473,6 +479,7 @@ private:
 
 TlsContext::Options::Options()
     : useSystemTrustStore(true),
+      verifyClients(false),
       minVersion(TlsVersion::TLS_1_0),
       cipherList("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS") {}
 // Cipher list is Mozilla's "intermediate" list, except with classic DH removed since we don't
@@ -514,6 +521,10 @@ TlsContext::TlsContext(Options options) {
         throwOpensslError();
       }
     }
+  }
+
+  if (options.verifyClients) {
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
   }
 
   // honor options.minVersion

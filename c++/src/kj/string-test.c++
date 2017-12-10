@@ -54,6 +54,12 @@ TEST(String, Str) {
   EXPECT_EQ("foo", str(mv(f)));
 }
 
+TEST(String, Nullptr) {
+  EXPECT_EQ(String(nullptr), "");
+  EXPECT_EQ(StringPtr(String(nullptr)).size(), 0u);
+  EXPECT_EQ(StringPtr(String(nullptr))[0], '\0');
+}
+
 TEST(String, StartsEndsWith) {
   EXPECT_TRUE(StringPtr("foobar").startsWith("foo"));
   EXPECT_FALSE(StringPtr("foobar").startsWith("bar"));
@@ -172,6 +178,18 @@ TEST(String, ToString) {
   EXPECT_EQ("foo", kj::str(Stringable()));
 }
 #endif
+
+KJ_TEST("string literals with _kj suffix") {
+  static constexpr StringPtr FOO = "foo"_kj;
+  KJ_EXPECT(FOO == "foo", FOO);
+  KJ_EXPECT(FOO[3] == 0);
+
+  KJ_EXPECT("foo\0bar"_kj == StringPtr("foo\0bar", 7));
+
+  static constexpr ArrayPtr<const char> ARR = "foo"_kj;
+  KJ_EXPECT(ARR.size() == 3);
+  KJ_EXPECT(kj::str(ARR) == "foo");
+}
 
 }  // namespace
 }  // namespace _ (private)

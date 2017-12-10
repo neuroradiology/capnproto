@@ -82,7 +82,7 @@ public:
   // Get the encoded schema node content as a single message segment.  It is safe to read as an
   // unchecked message.
 
-  Schema getDependency(uint64_t id) const KJ_DEPRECATED("Does not handle generics correctly.");
+  Schema getDependency(uint64_t id) const CAPNP_DEPRECATED("Does not handle generics correctly.");
   // DEPRECATED: This method cannot correctly account for generic type parameter bindings that
   //   may apply to the dependency. Instead of using this method, use a method of the Schema API
   //   that corresponds to the exact kind of dependency. For example, to get a field type, use
@@ -599,6 +599,8 @@ public:
 
   template <typename T>
   inline static Type from();
+  template <typename T>
+  inline static Type from(T&& value);
 
   inline schema::Type::Which which() const;
 
@@ -680,6 +682,9 @@ private:
 
   void requireUsableAs(Type expected) const;
 
+  template <typename T, Kind k>
+  struct FromValueImpl;
+
   friend class ListSchema;  // only for requireUsableAs()
 };
 
@@ -701,7 +706,7 @@ public:
   // Construct the schema for a list of the given type.
 
   static ListSchema of(schema::Type::Reader elementType, Schema context)
-      KJ_DEPRECATED("Does not handle generics correctly.");
+      CAPNP_DEPRECATED("Does not handle generics correctly.");
   // DEPRECATED: This method cannot correctly account for generic type parameter bindings that
   //   may apply to the input type. Instead of using this method, use a method of the Schema API
   //   that corresponds to the exact kind of dependency. For example, to get a field type, use
@@ -898,6 +903,29 @@ inline schema::Type::AnyPointer::Unconstrained::Which Type::whichAnyPointerKind(
 
 template <typename T>
 inline Type Type::from() { return Type(Schema::from<T>()); }
+
+template <typename T, Kind k>
+struct Type::FromValueImpl {
+  template <typename U>
+  static inline Type type(U&& value) {
+    return Type::from<T>();
+  }
+};
+
+template <typename T>
+struct Type::FromValueImpl<T, Kind::OTHER> {
+  template <typename U>
+  static inline Type type(U&& value) {
+    // All dynamic types have getSchema().
+    return value.getSchema();
+  }
+};
+
+template <typename T>
+inline Type Type::from(T&& value) {
+  typedef FromAny<kj::Decay<T>> Base;
+  return Type::FromValueImpl<Base, kind<Base>()>::type(kj::fwd<T>(value));
+}
 
 inline bool Type::isVoid   () const { return baseType == schema::Type::VOID     && listDepth == 0; }
 inline bool Type::isBool   () const { return baseType == schema::Type::BOOL     && listDepth == 0; }

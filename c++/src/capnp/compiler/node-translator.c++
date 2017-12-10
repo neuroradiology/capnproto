@@ -1069,7 +1069,7 @@ kj::String NodeTranslator::BrandedDecl::toString() {
 kj::String NodeTranslator::BrandedDecl::toDebugString() {
   if (body.is<Resolver::ResolvedParameter>()) {
     auto variable = body.get<Resolver::ResolvedParameter>();
-    return kj::str("varibale(", variable.id, ", ", variable.index, ")");
+    return kj::str("variable(", variable.id, ", ", variable.index, ")");
   } else {
     auto decl = body.get<Resolver::ResolvedDecl>();
     return kj::str("decl(", decl.id, ", ", (uint)decl.kind, "')");
@@ -1378,23 +1378,36 @@ NodeTranslator::NodeTranslator(
       localBrand(kj::refcounted<BrandScope>(
           errorReporter, wipNodeParam.getReader().getId(),
           decl.getParameters().size(), resolver)),
-      wipNode(kj::mv(wipNodeParam)) {
+      wipNode(kj::mv(wipNodeParam)),
+      sourceInfo(orphanage.newOrphan<schema::Node::SourceInfo>()) {
   compileNode(decl, wipNode.get());
 }
 
 NodeTranslator::~NodeTranslator() noexcept(false) {}
 
 NodeTranslator::NodeSet NodeTranslator::getBootstrapNode() {
+  auto sourceInfos = kj::heapArrayBuilder<schema::Node::SourceInfo::Reader>(
+      1 + groups.size() + paramStructs.size());
+  sourceInfos.add(sourceInfo.getReader());
+  for (auto& group: groups) {
+    sourceInfos.add(group.sourceInfo.getReader());
+  }
+  for (auto& paramStruct: paramStructs) {
+    sourceInfos.add(paramStruct.sourceInfo.getReader());
+  }
+
   auto nodeReader = wipNode.getReader();
   if (nodeReader.isInterface()) {
     return NodeSet {
       nodeReader,
-      KJ_MAP(g, paramStructs) { return g.getReader(); }
+      KJ_MAP(g, paramStructs) { return g.node.getReader(); },
+      sourceInfos.finish()
     };
   } else {
     return NodeSet {
       nodeReader,
-      KJ_MAP(g, groups) { return g.getReader(); }
+      KJ_MAP(g, groups) { return g.node.getReader(); },
+      sourceInfos.finish()
     };
   }
 }
@@ -1468,6 +1481,12 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
   }
 
   builder.adoptAnnotations(compileAnnotationApplications(decl.getAnnotations(), targetsFlagName));
+
+  auto di = sourceInfo.get();
+  di.setId(wipNode.getReader().getId());
+  if (decl.hasDocComment()) {
+    di.setDocComment(decl.getDocComment());
+  }
 }
 
 static kj::StringPtr getExpressionTargetName(Expression::Reader exp) {
@@ -1696,6 +1715,7 @@ void NodeTranslator::compileEnum(Void decl,
   }
 
   auto list = builder.initEnum().initEnumerants(enumerants.size());
+  auto sourceInfoList = sourceInfo.get().initMembers(enumerants.size());
   uint i = 0;
   DuplicateOrdinalDetector dupDetector(errorReporter);
 
@@ -1704,6 +1724,10 @@ void NodeTranslator::compileEnum(Void decl,
     Declaration::Reader enumerantDecl = entry.second.second;
 
     dupDetector.check(enumerantDecl.getId().getOrdinal());
+
+    if (enumerantDecl.hasDocComment()) {
+      sourceInfoList[i].setDocComment(enumerantDecl.getDocComment());
+    }
 
     auto enumerantBuilder = list[i++];
     enumerantBuilder.setName(enumerantDecl.getName().getValue());
@@ -1722,16 +1746,18 @@ public:
         implicitMethodParams(implicitMethodParams) {}
   KJ_DISALLOW_COPY(StructTranslator);
 
-  void translate(Void decl, List<Declaration>::Reader members, schema::Node::Builder builder) {
+  void translate(Void decl, List<Declaration>::Reader members, schema::Node::Builder builder,
+                 schema::Node::SourceInfo::Builder sourceInfo) {
     // Build the member-info-by-ordinal map.
-    MemberInfo root(builder);
+    MemberInfo root(builder, sourceInfo);
     traverseTopOrGroup(members, root, layout.getTop());
     translateInternal(root, builder);
   }
 
-  void translate(List<Declaration::Param>::Reader params, schema::Node::Builder builder) {
+  void translate(List<Declaration::Param>::Reader params, schema::Node::Builder builder,
+                 schema::Node::SourceInfo::Builder sourceInfo) {
     // Build a struct from a method param / result list.
-    MemberInfo root(builder);
+    MemberInfo root(builder, sourceInfo);
     traverseParams(params, root, layout.getTop());
     translateInternal(root, builder);
   }
@@ -1742,6 +1768,16 @@ private:
   ImplicitParams implicitMethodParams;
   StructLayout layout;
   kj::Arena arena;
+
+  struct NodeSourceInfoBuilderPair {
+    schema::Node::Builder node;
+    schema::Node::SourceInfo::Builder sourceInfo;
+  };
+
+  struct FieldSourceInfoBuilderPair {
+    schema::Field::Builder field;
+    schema::Node::SourceInfo::Member::Builder sourceInfo;
+  };
 
   struct MemberInfo {
     MemberInfo* parent;
@@ -1780,10 +1816,13 @@ private:
     // Information about the field declaration.  We don't use Declaration::Reader because it might
     // have come from a Declaration::Param instead.
 
+    kj::Maybe<Text::Reader> docComment = nullptr;
+
     kj::Maybe<schema::Field::Builder> schema;
     // Schema for the field.  Initialized when getSchema() is first called.
 
     schema::Node::Builder node;
+    schema::Node::SourceInfo::Builder sourceInfo;
     // If it's a group, or the top-level struct.
 
     union {
@@ -1798,8 +1837,10 @@ private:
       // copy over the discriminant offset to the schema.
     };
 
-    inline explicit MemberInfo(schema::Node::Builder node)
-        : parent(nullptr), codeOrder(0), isInUnion(false), node(node), unionScope(nullptr) {}
+    inline explicit MemberInfo(schema::Node::Builder node,
+                               schema::Node::SourceInfo::Builder sourceInfo)
+        : parent(nullptr), codeOrder(0), isInUnion(false), node(node), sourceInfo(sourceInfo),
+          unionScope(nullptr) {}
     inline MemberInfo(MemberInfo& parent, uint codeOrder,
                       const Declaration::Reader& decl,
                       StructLayout::StructOrGroup& fieldScope,
@@ -1808,13 +1849,16 @@ private:
           name(decl.getName().getValue()), declId(decl.getId()), declKind(Declaration::FIELD),
           declAnnotations(decl.getAnnotations()),
           startByte(decl.getStartByte()), endByte(decl.getEndByte()),
-          node(nullptr), fieldScope(&fieldScope) {
+          node(nullptr), sourceInfo(nullptr), fieldScope(&fieldScope) {
       KJ_REQUIRE(decl.which() == Declaration::FIELD);
       auto fieldDecl = decl.getField();
       fieldType = fieldDecl.getType();
       if (fieldDecl.getDefaultValue().isValue()) {
         hasDefaultValue = true;
         fieldDefaultValue = fieldDecl.getDefaultValue().getValue();
+      }
+      if (decl.hasDocComment()) {
+        docComment = decl.getDocComment();
       }
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder,
@@ -1825,7 +1869,7 @@ private:
           name(decl.getName().getValue()), declKind(Declaration::FIELD), isParam(true),
           declAnnotations(decl.getAnnotations()),
           startByte(decl.getStartByte()), endByte(decl.getEndByte()),
-          node(nullptr), fieldScope(&fieldScope) {
+          node(nullptr), sourceInfo(nullptr), fieldScope(&fieldScope) {
       fieldType = decl.getType();
       if (decl.getDefaultValue().isValue()) {
         hasDefaultValue = true;
@@ -1834,14 +1878,17 @@ private:
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder,
                       const Declaration::Reader& decl,
-                      schema::Node::Builder node,
+                      NodeSourceInfoBuilderPair builderPair,
                       bool isInUnion)
         : parent(&parent), codeOrder(codeOrder), isInUnion(isInUnion),
           name(decl.getName().getValue()), declId(decl.getId()), declKind(decl.which()),
           declAnnotations(decl.getAnnotations()),
           startByte(decl.getStartByte()), endByte(decl.getEndByte()),
-          node(node), unionScope(nullptr) {
+          node(builderPair.node), sourceInfo(builderPair.sourceInfo), unionScope(nullptr) {
       KJ_REQUIRE(decl.which() != Declaration::FIELD);
+      if (decl.hasDocComment()) {
+        docComment = decl.getDocComment();
+      }
     }
 
     schema::Field::Builder getSchema() {
@@ -1849,18 +1896,24 @@ private:
         return *result;
       } else {
         index = parent->childInitializedCount;
-        auto builder = parent->addMemberSchema();
+        auto builderPair = parent->addMemberSchema();
+        auto builder = builderPair.field;
         if (isInUnion) {
           builder.setDiscriminantValue(parent->unionDiscriminantCount++);
         }
         builder.setName(name);
         builder.setCodeOrder(codeOrder);
+
+        KJ_IF_MAYBE(dc, docComment) {
+          builderPair.sourceInfo.setDocComment(*dc);
+        }
+
         schema = builder;
         return builder;
       }
     }
 
-    schema::Field::Builder addMemberSchema() {
+    FieldSourceInfoBuilderPair addMemberSchema() {
       // Get the schema builder for the child member at the given index.  This lazily/dynamically
       // builds the builder tree.
 
@@ -1871,9 +1924,19 @@ private:
         if (parent != nullptr) {
           getSchema();  // Make sure field exists in parent once the first child is added.
         }
-        return structNode.initFields(childCount)[childInitializedCount++];
+        FieldSourceInfoBuilderPair result {
+          structNode.initFields(childCount)[childInitializedCount],
+          sourceInfo.initMembers(childCount)[childInitializedCount]
+        };
+        ++childInitializedCount;
+        return result;
       } else {
-        return structNode.getFields()[childInitializedCount++];
+        FieldSourceInfoBuilderPair result {
+          structNode.getFields()[childInitializedCount],
+          sourceInfo.getMembers()[childInitializedCount]
+        };
+        ++childInitializedCount;
+        return result;
       }
     }
 
@@ -1890,6 +1953,11 @@ private:
         node.setId(groupId);
         node.setScopeId(parent->node.getId());
         getSchema().initGroup().setTypeId(groupId);
+
+        sourceInfo.setId(groupId);
+        KJ_IF_MAYBE(dc, docComment) {
+          sourceInfo.setDocComment(*dc);
+        }
       }
     }
   };
@@ -2062,9 +2130,13 @@ private:
     }
   }
 
-  schema::Node::Builder newGroupNode(schema::Node::Reader parent, kj::StringPtr name) {
-    auto orphan = translator.orphanage.newOrphan<schema::Node>();
-    auto node = orphan.get();
+  NodeSourceInfoBuilderPair newGroupNode(schema::Node::Reader parent, kj::StringPtr name) {
+    AuxNode aux {
+      translator.orphanage.newOrphan<schema::Node>(),
+      translator.orphanage.newOrphan<schema::Node::SourceInfo>()
+    };
+    auto node = aux.node.get();
+    auto sourceInfo = aux.sourceInfo.get();
 
     // We'll set the ID and scope ID later.
     node.setDisplayName(kj::str(parent.getDisplayName(), '.', name));
@@ -2074,8 +2146,8 @@ private:
 
     // The remaining contents of node.struct will be filled in later.
 
-    translator.groups.add(kj::mv(orphan));
-    return node;
+    translator.groups.add(kj::mv(aux));
+    return { node, sourceInfo };
   }
 
   void translateInternal(MemberInfo& root, schema::Node::Builder builder) {
@@ -2227,7 +2299,7 @@ private:
     structBuilder.setPreferredListEncoding(schema::ElementSize::INLINE_COMPOSITE);
 
     for (auto& group: translator.groups) {
-      auto groupBuilder = group.get().getStruct();
+      auto groupBuilder = group.node.get().getStruct();
       groupBuilder.setDataWordCount(structBuilder.getDataWordCount());
       groupBuilder.setPointerCount(structBuilder.getPointerCount());
       groupBuilder.setPreferredListEncoding(structBuilder.getPreferredListEncoding());
@@ -2237,7 +2309,7 @@ private:
 
 void NodeTranslator::compileStruct(Void decl, List<Declaration>::Reader members,
                                    schema::Node::Builder builder) {
-  StructTranslator(*this, noImplicitParams()).translate(decl, members, builder);
+  StructTranslator(*this, noImplicitParams()).translate(decl, members, builder, sourceInfo.get());
 }
 
 // -------------------------------------------------------------------
@@ -2285,6 +2357,7 @@ void NodeTranslator::compileInterface(Declaration::Interface::Reader decl,
   }
 
   auto list = interfaceBuilder.initMethods(methods.size());
+  auto sourceInfoList = sourceInfo.get().initMembers(methods.size());
   uint i = 0;
   DuplicateOrdinalDetector dupDetector(errorReporter);
 
@@ -2296,6 +2369,10 @@ void NodeTranslator::compileInterface(Declaration::Interface::Reader decl,
     auto ordinalDecl = methodDecl.getId().getOrdinal();
     dupDetector.check(ordinalDecl);
     uint16_t ordinal = ordinalDecl.getValue();
+
+    if (methodDecl.hasDocComment()) {
+      sourceInfoList[i].setDocComment(methodDecl.getDocComment());
+    }
 
     auto methodBuilder = list[i++];
     methodBuilder.setName(methodDecl.getName().getValue());
@@ -2340,6 +2417,7 @@ uint64_t NodeTranslator::compileParamList(
   switch (paramList.which()) {
     case Declaration::ParamList::NAMED_LIST: {
       auto newStruct = orphanage.newOrphan<schema::Node>();
+      auto newSourceInfo = orphanage.newOrphan<schema::Node::SourceInfo>();
       auto builder = newStruct.get();
       auto parent = wipNode.getReader();
 
@@ -2358,9 +2436,9 @@ uint64_t NodeTranslator::compileParamList(
       // params as types actually need to refer to them as regular params, so we create an
       // ImplicitParams with a scopeId here.
       StructTranslator(*this, ImplicitParams { builder.getId(), implicitParams })
-          .translate(paramList.getNamedList(), builder);
+          .translate(paramList.getNamedList(), builder, newSourceInfo.get());
       uint64_t id = builder.getId();
-      paramStructs.add(kj::mv(newStruct));
+      paramStructs.add(AuxNode { kj::mv(newStruct), kj::mv(newSourceInfo) });
 
       auto brand = localBrand->push(builder.getId(), implicitParams.size());
 

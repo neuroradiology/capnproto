@@ -24,16 +24,18 @@
 #include "debug.h"
 #include "threadlocal.h"
 #include "miniposix.h"
+#include "function.h"
 #include <stdlib.h>
 #include <exception>
 #include <new>
 #include <signal.h>
+#include <stdint.h>
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
 #include "io.h"
 
-#if (__linux__ && __GLIBC__) || __APPLE__
+#if (__linux__ && __GLIBC__ && !__UCLIBC__) || __APPLE__
 #define KJ_HAS_BACKTRACE 1
 #include <execinfo.h>
 #endif
@@ -48,6 +50,10 @@
 #if (__linux__ || __APPLE__)
 #include <stdio.h>
 #include <pthread.h>
+#endif
+
+#if KJ_HAS_LIBDL
+#include "dlfcn.h"
 #endif
 
 namespace kj {
@@ -166,6 +172,16 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount) {
   return getStackTrace(space, ignoreCount, GetCurrentThread(), context);
 #elif KJ_HAS_BACKTRACE
   size_t size = backtrace(space.begin(), space.size());
+  for (auto& addr: space.slice(0, size)) {
+    // The addresses produced by backtrace() are return addresses, which means they point to the
+    // instruction immediately after the call. Invoking addr2line on these can be confusing because
+    // it often points to the next line. If the next instruction is inlined from another function,
+    // the trace can be extra-confusing, since now it claims to be in a function that was not
+    // actually on the call stack. If we subtract 1 from each address, though, we get a much more
+    // reasonable trace. This may cause the addresses to be invalid instruction pointers if the
+    // instructions were multi-byte, but it appears addr2line is able to cope with this.
+    addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) - 1);
+  }
   return space.slice(kj::min(ignoreCount + 1, size), size);
 #else
   return nullptr;
@@ -284,10 +300,33 @@ String stringifyStackTrace(ArrayPtr<void* const> trace) {
 #endif
 }
 
+String stringifyStackTraceAddresses(ArrayPtr<void* const> trace) {
+#if KJ_HAS_LIBDL
+  return strArray(KJ_MAP(addr, trace) {
+    Dl_info info;
+    // Shared libraries are mapped near the end of the address space while the executable is mapped
+    // near the beginning. We want to print addresses in the executable as raw addresses, not
+    // offsets, since that's what addr2line expects for executables. For shared libraries it
+    // expects offsets. In any case, most frames are likely to be in the main executable so it
+    // makes the output cleaner if we don't repeatedly write its name.
+    if (reinterpret_cast<uintptr_t>(addr) >= 0x400000000000ull && dladdr(addr, &info)) {
+      uintptr_t offset = reinterpret_cast<uintptr_t>(addr) -
+                         reinterpret_cast<uintptr_t>(info.dli_fbase);
+      return kj::str(info.dli_fname, '@', reinterpret_cast<void*>(offset));
+    } else {
+      return kj::str(addr);
+    }
+  }, " ");
+#else
+  // TODO(someday): Support other platforms.
+  return kj::strArray(trace, " ");
+#endif
+}
+
 String getStackTrace() {
   void* space[32];
   auto trace = getStackTrace(space, 2);
-  return kj::str(kj::strArray(trace, " "), stringifyStackTrace(trace));
+  return kj::str(stringifyStackTraceAddresses(trace), stringifyStackTrace(trace));
 }
 
 #if _WIN32 && _M_X64
@@ -309,7 +348,8 @@ BOOL WINAPI breakHandler(DWORD type) {
             void* traceSpace[32];
             auto trace = getStackTrace(traceSpace, 2, thread, context);
             ResumeThread(thread);
-            auto message = kj::str("*** Received CTRL+C. stack: ", strArray(trace, " "),
+            auto message = kj::str("*** Received CTRL+C. stack: ",
+                                   stringifyStackTraceAddresses(trace),
                                    stringifyStackTrace(trace), '\n');
             FdOutputStream(STDERR_FILENO).write(message.begin(), message.size());
           } else {
@@ -344,7 +384,7 @@ void crashHandler(int signo, siginfo_t* info, void* context) {
   auto trace = getStackTrace(traceSpace, 2);
 
   auto message = kj::str("*** Received signal #", signo, ": ", strsignal(signo),
-                         "\nstack: ", strArray(trace, " "),
+                         "\nstack: ", stringifyStackTraceAddresses(trace),
                          stringifyStackTrace(trace), '\n');
 
   FdOutputStream(STDERR_FILENO).write(message.begin(), message.size());
@@ -491,7 +531,8 @@ String KJ_STRINGIFY(const Exception& e) {
   return str(strArray(contextText, ""),
              e.getFile(), ":", e.getLine(), ": ", e.getType(),
              e.getDescription() == nullptr ? "" : ": ", e.getDescription(),
-             e.getStackTrace().size() > 0 ? "\nstack: " : "", strArray(e.getStackTrace(), " "),
+             e.getStackTrace().size() > 0 ? "\nstack: " : "",
+             stringifyStackTraceAddresses(e.getStackTrace()),
              stringifyStackTrace(e.getStackTrace()));
 }
 
@@ -649,6 +690,10 @@ ExceptionCallback::StackTraceMode ExceptionCallback::stackTraceMode() {
   return next.stackTraceMode();
 }
 
+Function<void(Function<void()>)> ExceptionCallback::getThreadInitializer() {
+  return next.getThreadInitializer();
+}
+
 class ExceptionCallback::RootExceptionCallback: public ExceptionCallback {
 public:
   RootExceptionCallback(): ExceptionCallback(*this) {}
@@ -685,7 +730,7 @@ public:
 
     StringPtr textPtr = text;
 
-    while (text != nullptr) {
+    while (textPtr != nullptr) {
       miniposix::ssize_t n = miniposix::write(STDERR_FILENO, textPtr.begin(), textPtr.size());
       if (n <= 0) {
         // stderr is broken.  Give up.
@@ -703,6 +748,14 @@ public:
 #endif
   }
 
+  Function<void(Function<void()>)> getThreadInitializer() override {
+    return [](Function<void()> func) {
+      // No initialization needed since RootExceptionCallback is automatically the root callback
+      // for new threads.
+      func();
+    };
+  }
+
 private:
   void logException(LogSeverity severity, Exception&& e) {
     // We intentionally go back to the top exception callback on the stack because we don't want to
@@ -712,7 +765,8 @@ private:
     // anyway.
     getExceptionCallback().logMessage(severity, e.getFile(), e.getLine(), 0, str(
         e.getType(), e.getDescription() == nullptr ? "" : ": ", e.getDescription(),
-        e.getStackTrace().size() > 0 ? "\nstack: " : "", strArray(e.getStackTrace(), " "),
+        e.getStackTrace().size() > 0 ? "\nstack: " : "",
+        stringifyStackTraceAddresses(e.getStackTrace()),
         stringifyStackTrace(e.getStackTrace()), "\n"));
   }
 };

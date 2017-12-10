@@ -33,6 +33,7 @@
 #include <kj/vector.h>
 #include <kj/one-of.h>
 #include "error-reporter.h"
+#include <map>
 
 namespace capnp {
 namespace compiler {
@@ -136,6 +137,9 @@ public:
     // Auxiliary nodes that were produced when translating this node and should be loaded along
     // with it.  In particular, structs that contain groups (or named unions) spawn extra nodes
     // representing those, and interfaces spawn struct nodes representing method params/results.
+
+    kj::Array<schema::Node::SourceInfo::Reader> sourceInfo;
+    // The SourceInfo for the node and all aux nodes.
   };
 
   NodeSet getBootstrapNode();
@@ -177,11 +181,19 @@ private:
   Orphan<schema::Node> wipNode;
   // The work-in-progress schema node.
 
-  kj::Vector<Orphan<schema::Node>> groups;
+  Orphan<schema::Node::SourceInfo> sourceInfo;
+  // Doc comments and other source info for this node.
+
+  struct AuxNode {
+    Orphan<schema::Node> node;
+    Orphan<schema::Node::SourceInfo> sourceInfo;
+  };
+
+  kj::Vector<AuxNode> groups;
   // If this is a struct node and it contains groups, these are the nodes for those groups,  which
   // must be loaded together with the top-level node.
 
-  kj::Vector<Orphan<schema::Node>> paramStructs;
+  kj::Vector<AuxNode> paramStructs;
   // If this is an interface, these are the auto-generated structs representing params and results.
 
   struct UnfinishedValue {

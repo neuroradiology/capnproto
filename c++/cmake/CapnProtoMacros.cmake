@@ -3,12 +3,12 @@
 # Example usage:
 #   find_package(CapnProto)
 #   capnp_generate_cpp(CAPNP_SRCS CAPNP_HDRS schema.capnp)
-#   include_directories(${CMAKE_CURRENT_BINARY_DIR})
 #   add_executable(foo main.cpp ${CAPNP_SRCS})
-#   target_link_libraries(foo CapnProto::capnp-rpc)
+#   target_link_libraries(foo PRIVATE CapnProto::capnp-rpc)
+#   target_include_directories(foo PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 #
-#  If you are using not using the RPC features you can use
-#  'CapnProto::capnp' in target_link_libraries call
+#  If you are not using the RPC features you can use 'CapnProto::capnp' in the
+#  target_link_libraries call
 #
 # Configuration variables (optional):
 #   CAPNPC_OUTPUT_DIR
@@ -71,11 +71,11 @@ function(CAPNP_GENERATE_CPP SOURCES HEADERS)
   set(${SOURCES})
   set(${HEADERS})
   foreach(schema_file ${ARGN})
-    if(NOT EXISTS "${CAPNPC_SRC_PREFIX}/${schema_file}")
-      message(FATAL_ERROR "Cap'n Proto schema file '${CAPNPC_SRC_PREFIX}/${schema_file}' does not exist!")
-    endif()
     get_filename_component(file_path "${schema_file}" ABSOLUTE)
     get_filename_component(file_dir "${file_path}" PATH)
+    if(NOT EXISTS "${file_path}")
+      message(FATAL_ERROR "Cap'n Proto schema file '${file_path}' does not exist!")
+    endif()
 
     # Figure out where the output files will go
     if (NOT DEFINED CAPNPC_OUTPUT_DIR)

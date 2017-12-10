@@ -166,7 +166,7 @@ typedef unsigned char byte;
 #define KJ_NOINLINE __attribute__((noinline))
 #endif
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !__clang__
 #define KJ_NORETURN(prototype) __declspec(noreturn) prototype
 #define KJ_UNUSED
 #define KJ_WARN_UNUSED_RESULT
@@ -200,6 +200,11 @@ typedef unsigned char byte;
 #define KJ_DEPRECATED(reason)
 #define KJ_UNAVAILABLE(reason)
 // TODO(msvc): Again, here, MSVC prefers a prefix, __declspec(deprecated).
+#endif
+
+#if KJ_TESTING_KJ  // defined in KJ's own unit tests; others should not define this
+#undef KJ_DEPRECATED
+#define KJ_DEPRECATED(reason)
 #endif
 
 namespace _ {  // private
@@ -256,7 +261,7 @@ KJ_NORETURN(void unreachable());
 #define KJ_STACK_ARRAY(type, name, size, minStack, maxStack) \
   size_t name##_size = (size); \
   bool name##_isOnStack = name##_size <= (maxStack); \
-  type name##_stack[name##_isOnStack ? size : 0]; \
+  type name##_stack[kj::max(1, name##_isOnStack ? name##_size : 0)]; \
   ::kj::Array<type> name##_heap = name##_isOnStack ? \
       nullptr : kj::heapArray<type>(name##_size); \
   ::kj::ArrayPtr<type> name = name##_isOnStack ? \
@@ -630,7 +635,7 @@ struct ThrowOverflow {
   void operator()() const;
 };
 
-#if __GNUC__
+#if __GNUC__ || __clang__
 inline constexpr float inf() { return __builtin_huge_valf(); }
 inline constexpr float nan() { return __builtin_nanf(""); }
 
@@ -1180,7 +1185,7 @@ public:
   template <typename U>
   inline Maybe(Maybe<U&>& other) noexcept: ptr(other.ptr) {}
   template <typename U>
-  inline Maybe(const Maybe<const U&>& other) noexcept: ptr(other.ptr) {}
+  inline Maybe(const Maybe<U&>& other) noexcept: ptr(const_cast<const U*>(other.ptr)) {}
   inline Maybe(decltype(nullptr)) noexcept: ptr(nullptr) {}
 
   inline Maybe& operator=(T& other) noexcept { ptr = &other; return *this; }
@@ -1214,6 +1219,16 @@ public:
       return nullptr;
     } else {
       return f(*ptr);
+    }
+  }
+
+  template <typename Func>
+  auto map(Func&& f) const -> Maybe<decltype(f(instance<const T&>()))> {
+    if (ptr == nullptr) {
+      return nullptr;
+    } else {
+      const T& ref = *ptr;
+      return f(ref);
     }
   }
 
@@ -1280,7 +1295,7 @@ public:
     return ArrayPtr<const T>(ptr, size_);
   }
 
-  inline size_t size() const { return size_; }
+  inline constexpr size_t size() const { return size_; }
   inline const T& operator[](size_t index) const {
     KJ_IREQUIRE(index < size_, "Out-of-bounds ArrayPtr access.");
     return ptr[index];
@@ -1294,8 +1309,8 @@ public:
   inline T* end() { return ptr + size_; }
   inline T& front() { return *ptr; }
   inline T& back() { return *(ptr + size_ - 1); }
-  inline const T* begin() const { return ptr; }
-  inline const T* end() const { return ptr + size_; }
+  inline constexpr const T* begin() const { return ptr; }
+  inline constexpr const T* end() const { return ptr + size_; }
   inline const T& front() const { return *ptr; }
   inline const T& back() const { return *(ptr + size_ - 1); }
 

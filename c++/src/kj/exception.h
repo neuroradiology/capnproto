@@ -33,6 +33,7 @@
 namespace kj {
 
 class ExceptionImpl;
+template <typename T> class Function;
 
 class Exception {
   // Exception thrown in case of fatal errors.
@@ -216,6 +217,11 @@ public:
   virtual StackTraceMode stackTraceMode();
   // Returns the current preferred stack trace mode.
 
+  virtual Function<void(Function<void()>)> getThreadInitializer();
+  // Called just before a new thread is spawned using kj::Thread. Returns a function which should
+  // be invoked inside the new thread to initialize the thread's ExceptionCallback. The initializer
+  // function itself receives, as its parameter, the thread's main function, which it must call.
+
 protected:
   ExceptionCallback& next;
 
@@ -224,6 +230,8 @@ private:
 
   class RootExceptionCallback;
   friend ExceptionCallback& getExceptionCallback();
+
+  friend class Thread;
 };
 
 ExceptionCallback& getExceptionCallback();
@@ -345,6 +353,14 @@ KJ_NOINLINE ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint igno
 String stringifyStackTrace(ArrayPtr<void* const>);
 // Convert the stack trace to a string with file names and line numbers. This may involve executing
 // suprocesses.
+
+String stringifyStackTraceAddresses(ArrayPtr<void* const> trace);
+// Construct a string containing just enough information about a stack trace to be able to convert
+// it to file and line numbers later using offline tools. This produces a sequence of
+// space-separated code location identifiers. Each identifier may be an absolute address
+// (hex number starting with 0x) or may be a module-relative address "<module>@0x<hex>". The
+// latter case is preferred when ASLR is in effect and has loaded different modules at different
+// addresses.
 
 String getStackTrace();
 // Get a stack trace right now and stringify it. Useful for debugging.
