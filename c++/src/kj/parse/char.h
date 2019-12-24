@@ -22,16 +22,13 @@
 // This file contains parsers useful for character stream inputs, including parsers to parse
 // common kinds of tokens like identifiers, numbers, and quoted strings.
 
-#ifndef KJ_PARSE_CHAR_H_
-#define KJ_PARSE_CHAR_H_
-
-#if defined(__GNUC__) && !KJ_HEADER_WARNINGS
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "common.h"
 #include "../string.h"
 #include <inttypes.h>
+
+KJ_BEGIN_HEADER
 
 namespace kj {
 namespace parse {
@@ -366,4 +363,4 @@ constexpr auto doubleQuotedHexBinary = sequence(
 }  // namespace parse
 }  // namespace kj
 
-#endif  // KJ_PARSE_CHAR_H_
+KJ_END_HEADER

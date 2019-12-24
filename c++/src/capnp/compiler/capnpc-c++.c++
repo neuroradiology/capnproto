@@ -28,19 +28,26 @@
 #include <kj/string-tree.h>
 #include <kj/tuple.h>
 #include <kj/vector.h>
+#include <kj/filesystem.h>
 #include "../schema-loader.h"
 #include "../dynamic.h"
-#include <kj/miniposix.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
 #include <set>
 #include <kj/main.h>
 #include <algorithm>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <capnp/stream.capnp.h>
+
+#if _WIN32
+#define WIN32_LEAN_AND_MEAN  // ::eyeroll::
+#include <windows.h>
+#include <kj/windows-sanity.h>
+#undef VOID
+#undef CONST
+#else
+#include <sys/time.h>
+#endif
 
 #if HAVE_CONFIG_H
 #include "config.h"
@@ -295,6 +302,43 @@ kj::String KJ_STRINGIFY(const CppTypeName& typeName) {
   }
 }
 
+CppTypeName whichKind(schema::Type::Which which) {
+  // Make a CppTypeName representing the capnp::Kind value for the given schema type. This makes
+  // CppTypeName conflate types and values, but this is all just a hack for MSVC's benefit. Its
+  // primary use is as a non-type template parameter to `capnp::List<T, K>` -- normally the Kind K
+  // is deduced via SFINAE, but MSVC just can't do it in certain cases, such as when a nested type
+  // of `capnp::List<T, K>` is the return type of a function, and the element type T is a template
+  // instantiation.
+
+  switch (which) {
+      case schema::Type::VOID: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+
+      case schema::Type::BOOL: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::INT8: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::INT16: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::INT32: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::INT64: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::UINT8: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::UINT16: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::UINT32: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::UINT64: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::FLOAT32: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+      case schema::Type::FLOAT64: return CppTypeName::makePrimitive(" ::capnp::Kind::PRIMITIVE");
+
+      case schema::Type::TEXT: return CppTypeName::makePrimitive(" ::capnp::Kind::BLOB");
+      case schema::Type::DATA: return CppTypeName::makePrimitive(" ::capnp::Kind::BLOB");
+
+      case schema::Type::ENUM: return CppTypeName::makePrimitive(" ::capnp::Kind::ENUM");
+      case schema::Type::STRUCT: return CppTypeName::makePrimitive(" ::capnp::Kind::STRUCT");
+      case schema::Type::INTERFACE: return CppTypeName::makePrimitive(" ::capnp::Kind::INTERFACE");
+
+      case schema::Type::LIST: return CppTypeName::makePrimitive(" ::capnp::Kind::LIST");
+      case schema::Type::ANY_POINTER: return CppTypeName::makePrimitive(" ::capnp::Kind::OTHER");
+  }
+
+  KJ_UNREACHABLE;
+}
+
 // =======================================================================================
 
 class CapnpcCppMain {
@@ -467,8 +511,10 @@ private:
 
       case schema::Type::LIST: {
         CppTypeName result = CppTypeName::makeNamespace("capnp");
-        auto params = kj::heapArrayBuilder<CppTypeName>(1);
-        params.add(typeName(type.asList().getElementType(), method));
+        auto params = kj::heapArrayBuilder<CppTypeName>(2);
+        auto list = type.asList();
+        params.add(typeName(list.getElementType(), method));
+        params.add(whichKind(list.whichElementType()));
         result.addMemberTemplate("List", params.finish());
         return result;
       }
@@ -784,7 +830,14 @@ private:
   }
 
   kj::Maybe<kj::StringTree> makeBrandDepInitializer(Schema type) {
-    return makeBrandDepInitializer(type, cppFullName(type, nullptr));
+    // Be careful not to invoke cppFullName() if it would just be thrown away, as doing so will
+    // add the type's declaring file to `usedImports`. In particular, this causes `stream.capnp.h`
+    // to be #included unnecessarily.
+    if (type.isBranded()) {
+      return makeBrandDepInitializer(type, cppFullName(type, nullptr));
+    } else {
+      return nullptr;
+    }
   }
 
   kj::Maybe<kj::StringTree> makeBrandDepInitializer(
@@ -2094,6 +2147,8 @@ private:
     auto paramProto = paramSchema.getProto();
     auto resultProto = resultSchema.getProto();
 
+    bool isStreaming = method.isStreaming();
+
     auto implicitParamsReader = proto.getImplicitParameters();
     auto implicitParamsBuilder = kj::heapArrayBuilder<CppTypeName>(implicitParamsReader.size());
     for (auto param: implicitParamsReader) {
@@ -2130,7 +2185,10 @@ private:
     }
     CppTypeName resultType;
     CppTypeName genericResultType;
-    if (resultProto.getScopeId() == 0) {
+    if (isStreaming) {
+      // We don't use resultType or genericResultType in this case. We want to avoid computing them
+      // at all so that we don't end up marking stream.capnp.h in usedImports.
+    } else if (resultProto.getScopeId() == 0) {
       resultType = interfaceTypeName;
       if (implicitParams.size() == 0) {
         resultType.addMemberType(kj::str(titleCase, "Results"));
@@ -2148,7 +2206,7 @@ private:
 
     kj::String shortParamType = paramProto.getScopeId() == 0 ?
         kj::str(titleCase, "Params") : kj::str(genericParamType);
-    kj::String shortResultType = resultProto.getScopeId() == 0 ?
+    kj::String shortResultType = resultProto.getScopeId() == 0 || isStreaming ?
         kj::str(titleCase, "Results") : kj::str(genericResultType);
 
     auto interfaceProto = method.getContainingInterface().getProto();
@@ -2170,10 +2228,13 @@ private:
         templateContext.allDecls(),
         implicitParamsTemplateDecl,
         templateContext.isGeneric() ? "CAPNP_AUTO_IF_MSVC(" : "",
-        "::capnp::Request<", paramType, ", ", resultType, ">",
+        isStreaming ? kj::strTree("::capnp::StreamingRequest<", paramType, ">")
+                    : kj::strTree("::capnp::Request<", paramType, ", ", resultType, ">"),
         templateContext.isGeneric() ? ")\n" : "\n",
-        interfaceName, "::Client::", name, "Request(::kj::Maybe< ::capnp::MessageSize> sizeHint) {\n"
-        "  return newCall<", paramType, ", ", resultType, ">(\n"
+        interfaceName, "::Client::", name, "Request(::kj::Maybe< ::capnp::MessageSize> sizeHint) {\n",
+        isStreaming
+            ? kj::strTree("  return newStreamingCall<", paramType, ">(\n")
+            : kj::strTree("  return newCall<", paramType, ", ", resultType, ">(\n"),
         "      0x", interfaceIdHex, "ull, ", methodId, ", sizeHint);\n"
         "}\n");
 
@@ -2181,7 +2242,8 @@ private:
       kj::strTree(
           implicitParamsTemplateDecl.size() == 0 ? "" : "  ", implicitParamsTemplateDecl,
           templateContext.isGeneric() ? "  CAPNP_AUTO_IF_MSVC(" : "  ",
-          "::capnp::Request<", paramType, ", ", resultType, ">",
+          isStreaming ? kj::strTree("::capnp::StreamingRequest<", paramType, ">")
+                      : kj::strTree("::capnp::Request<", paramType, ", ", resultType, ">"),
           templateContext.isGeneric() ? ")" : "",
           " ", name, "Request(\n"
           "      ::kj::Maybe< ::capnp::MessageSize> sizeHint = nullptr);\n"),
@@ -2191,8 +2253,11 @@ private:
               "  typedef ", genericParamType, " ", titleCase, "Params;\n"),
           resultProto.getScopeId() != 0 ? kj::strTree() : kj::strTree(
               "  typedef ", genericResultType, " ", titleCase, "Results;\n"),
-          "  typedef ::capnp::CallContext<", shortParamType, ", ", shortResultType, "> ",
-                titleCase, "Context;\n"
+          isStreaming
+              ? kj::strTree("  typedef ::capnp::StreamingCallContext<", shortParamType, "> ")
+              : kj::strTree(
+                  "  typedef ::capnp::CallContext<", shortParamType, ", ", shortResultType, "> "),
+              titleCase, "Context;\n"
           "  virtual ::kj::Promise<void> ", identifierName, "(", titleCase, "Context context);\n"),
 
       implicitParams.size() == 0 ? kj::strTree() : kj::mv(requestMethodImpl),
@@ -2207,9 +2272,29 @@ private:
           "}\n"),
 
       kj::strTree(
-          "    case ", methodId, ":\n"
-          "      return ", identifierName, "(::capnp::Capability::Server::internalGetTypedContext<\n"
-          "          ", genericParamType, ", ", genericResultType, ">(context));\n")
+          "    case ", methodId, ":\n",
+          isStreaming
+            ? kj::strTree(
+              // For streaming calls, we need to add an evalNow() here so that exceptions thrown
+              // directly from the call can propagate to later calls. If we don't capture the
+              // exception properly then the caller will never find out that this is a streaming
+              // call (indicated by the boolean in the return value) so won't know to propagate
+              // the exception.
+              "      return {\n"
+              "        kj::evalNow([&]() {\n"
+              "          return ", identifierName, "(::capnp::Capability::Server::internalGetTypedStreamingContext<\n"
+              "              ", genericParamType, ">(context));\n"
+              "        }),\n"
+              "        true\n"
+              "      };\n")
+            : kj::strTree(
+              // For non-streaming calls we let exceptions just flow through for a little more
+              // efficiency.
+              "      return {\n"
+              "        ", identifierName, "(::capnp::Capability::Server::internalGetTypedContext<\n"
+              "            ", genericParamType, ", ", genericResultType, ">(context)),\n"
+              "        false\n"
+              "      };\n"))
     };
   }
 
@@ -2358,7 +2443,8 @@ private:
           "public:\n",
           "  typedef ", name, " Serves;\n"
           "\n"
-          "  ::kj::Promise<void> dispatchCall(uint64_t interfaceId, uint16_t methodId,\n"
+          "  ::capnp::Capability::Server::DispatchCallResult dispatchCall(\n"
+          "      uint64_t interfaceId, uint16_t methodId,\n"
           "      ::capnp::CallContext< ::capnp::AnyPointer, ::capnp::AnyPointer> context)\n"
           "      override;\n"
           "\n"
@@ -2370,7 +2456,8 @@ private:
           "        .template castAs<", typeName, ">();\n"
           "  }\n"
           "\n"
-          "  ::kj::Promise<void> dispatchCallInternal(uint16_t methodId,\n"
+          "  ::capnp::Capability::Server::DispatchCallResult dispatchCallInternal(\n"
+          "      uint16_t methodId,\n"
           "      ::capnp::CallContext< ::capnp::AnyPointer, ::capnp::AnyPointer> context);\n"
           "};\n"
           "#endif  // !CAPNP_LITE\n"
@@ -2414,7 +2501,7 @@ private:
           "#if !CAPNP_LITE\n",
           KJ_MAP(m, methods) { return kj::mv(m.sourceDefs); },
           templateContext.allDecls(),
-          "::kj::Promise<void> ", fullName, "::Server::dispatchCall(\n"
+          "::capnp::Capability::Server::DispatchCallResult ", fullName, "::Server::dispatchCall(\n"
           "    uint64_t interfaceId, uint16_t methodId,\n"
           "    ::capnp::CallContext< ::capnp::AnyPointer, ::capnp::AnyPointer> context) {\n"
           "  switch (interfaceId) {\n"
@@ -2431,7 +2518,7 @@ private:
           "  }\n"
           "}\n",
           templateContext.allDecls(),
-          "::kj::Promise<void> ", fullName, "::Server::dispatchCallInternal(\n"
+          "::capnp::Capability::Server::DispatchCallResult ", fullName, "::Server::dispatchCallInternal(\n"
           "    uint16_t methodId,\n"
           "    ::capnp::CallContext< ::capnp::AnyPointer, ::capnp::AnyPointer> context) {\n"
           "  switch (methodId) {\n",
@@ -2469,16 +2556,16 @@ private:
     const char* linkage = scope.size() == 0 ? "extern " : "static ";
 
     switch (type.which()) {
-      case schema::Value::BOOL:
-      case schema::Value::INT8:
-      case schema::Value::INT16:
-      case schema::Value::INT32:
-      case schema::Value::INT64:
-      case schema::Value::UINT8:
-      case schema::Value::UINT16:
-      case schema::Value::UINT32:
-      case schema::Value::UINT64:
-      case schema::Value::ENUM:
+      case schema::Type::BOOL:
+      case schema::Type::INT8:
+      case schema::Type::INT16:
+      case schema::Type::INT32:
+      case schema::Type::INT64:
+      case schema::Type::UINT8:
+      case schema::Type::UINT16:
+      case schema::Type::UINT32:
+      case schema::Type::UINT64:
+      case schema::Type::ENUM:
         return ConstText {
           false,
           kj::strTree("static constexpr ", typeName_, ' ', upperCase, " = ",
@@ -2491,9 +2578,9 @@ private:
               "#endif\n")
         };
 
-      case schema::Value::VOID:
-      case schema::Value::FLOAT32:
-      case schema::Value::FLOAT64: {
+      case schema::Type::VOID:
+      case schema::Type::FLOAT32:
+      case schema::Type::FLOAT64: {
         // TODO(msvc): MSVC doesn't like float- or class-typed constexprs. As soon as this is fixed,
         //   treat VOID, FLOAT32, and FLOAT64 the same as the other primitives.
         kj::String value = literalValue(schema.getType(), constProto.getValue()).flatten();
@@ -2507,7 +2594,7 @@ private:
         };
       }
 
-      case schema::Value::TEXT: {
+      case schema::Type::TEXT: {
         kj::String constType = kj::strTree(
             "::capnp::_::ConstText<", schema.as<Text>().size(), ">").flatten();
         return ConstText {
@@ -2518,7 +2605,7 @@ private:
         };
       }
 
-      case schema::Value::DATA: {
+      case schema::Type::DATA: {
         kj::String constType = kj::strTree(
             "::capnp::_::ConstData<", schema.as<Data>().size(), ">").flatten();
         return ConstText {
@@ -2529,7 +2616,7 @@ private:
         };
       }
 
-      case schema::Value::STRUCT: {
+      case schema::Type::STRUCT: {
         kj::String constType = kj::strTree(
             "::capnp::_::ConstStruct<", typeName_, ">").flatten();
         return ConstText {
@@ -2540,7 +2627,7 @@ private:
         };
       }
 
-      case schema::Value::LIST: {
+      case schema::Type::LIST: {
         kj::String constType = kj::strTree(
             "::capnp::_::ConstList<", typeName(type.asList().getElementType(), nullptr), ">")
             .flatten();
@@ -2552,8 +2639,8 @@ private:
         };
       }
 
-      case schema::Value::ANY_POINTER:
-      case schema::Value::INTERFACE:
+      case schema::Type::ANY_POINTER:
+      case schema::Type::INTERFACE:
         return ConstText { false, kj::strTree(), kj::strTree() };
     }
 
@@ -2933,10 +3020,10 @@ private:
           "// Generated by Cap'n Proto compiler, DO NOT EDIT\n"
           "// source: ", baseName(displayName), "\n"
           "\n"
-          "#ifndef CAPNP_INCLUDED_", kj::hex(node.getId()), "_\n",
-          "#define CAPNP_INCLUDED_", kj::hex(node.getId()), "_\n"
+          "#pragma once\n"
           "\n"
-          "#include <capnp/generated-header-support.h>\n",
+          "#include <capnp/generated-header-support.h>\n"
+          "#include <kj/windows-sanity.h>\n",  // work-around macro conflict with VOID
           hasInterfaces ? kj::strTree(
             "#if !CAPNP_LITE\n"
             "#include <capnp/capability.h>\n"
@@ -2971,8 +3058,7 @@ private:
           KJ_MAP(n, nodeTexts) { return kj::mv(n.readerBuilderDefs); },
           separator, "\n",
           KJ_MAP(n, nodeTexts) { return kj::mv(n.inlineMethodDefs); },
-          KJ_MAP(n, namespaceParts) { return kj::strTree("}  // namespace\n"); }, "\n",
-          "#endif  // CAPNP_INCLUDED_", kj::hex(node.getId()), "_\n"),
+          KJ_MAP(n, namespaceParts) { return kj::strTree("}  // namespace\n"); }, "\n"),
 
       kj::strTree(
           "// Generated by Cap'n Proto compiler, DO NOT EDIT\n"
@@ -2995,42 +3081,33 @@ private:
 
   // -----------------------------------------------------------------
 
-  void makeDirectory(kj::StringPtr path) {
-    KJ_IF_MAYBE(slashpos, path.findLast('/')) {
-      // Make the parent dir.
-      makeDirectory(kj::str(path.slice(0, *slashpos)));
-    }
-
-    if (kj::miniposix::mkdir(path.cStr(), 0777) < 0) {
-      int error = errno;
-      if (error != EEXIST) {
-        KJ_FAIL_SYSCALL("mkdir(path)", error, path);
-      }
-    }
-  }
+  kj::Own<kj::Filesystem> fs = kj::newDiskFilesystem();
 
   void writeFile(kj::StringPtr filename, const kj::StringTree& text) {
-    if (!filename.startsWith("/")) {
-      KJ_IF_MAYBE(slashpos, filename.findLast('/')) {
-        // Make the parent dir.
-        makeDirectory(kj::str(filename.slice(0, *slashpos)));
-      }
-    }
+    // We don't use replaceFile() here because atomic replacements are actually detrimental for
+    // build tools:
+    // - It's the responsibility of the build pipeline to ensure that no one else is concurrently
+    //   reading the file when we write it, so atomicity brings no benefit.
+    // - Atomic replacements force disk syncs which could slow us down for no benefit at all.
+    // - Opening the existing file and overwriting it may allow the filesystem to reuse
+    //   already-allocated blocks, or maybe even notice that no actual changes occurred.
+    // - In a power outage scenario, the user would obviously restart the build from scratch
+    //   anyway.
+    //
+    // At one point, in a fit of over-engineering, we used writable mmap() here. That turned out
+    // to be a bad idea: writable mmap() is not implemented on some filesystems, especially shared
+    // folders in VirtualBox. Oh well.
 
-    int fd;
-    KJ_SYSCALL(fd = open(filename.cStr(), O_CREAT | O_WRONLY | O_TRUNC, 0666), filename);
-    kj::FdOutputStream out((kj::AutoCloseFd(fd)));
-
-    text.visit(
-        [&](kj::ArrayPtr<const char> text) {
-          out.write(text.begin(), text.size());
-        });
+    auto path = kj::Path::parse(filename);
+    auto file = fs->getCurrent().openFile(path,
+        kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+    file->writeAll(text.flatten());
   }
 
   kj::MainBuilder::Validity run() {
     ReaderOptions options;
     options.traversalLimitInWords = 1 << 30;  // Don't limit.
-    StreamFdMessageReader reader(STDIN_FILENO, options);
+    StreamFdMessageReader reader(0, options);
     auto request = reader.getRoot<schema::CodeGeneratorRequest>();
 
     auto capnpVersion = request.getCapnpVersion();
@@ -3057,9 +3134,6 @@ private:
     for (auto node: request.getNodes()) {
       schemaLoader.load(node);
     }
-
-    kj::FdOutputStream rawOut(STDOUT_FILENO);
-    kj::BufferedOutputStreamWrapper out(rawOut);
 
     for (auto requestedFile: request.getRequestedFiles()) {
       auto schema = schemaLoader.get(requestedFile.getId());

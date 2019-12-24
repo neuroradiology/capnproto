@@ -21,12 +21,7 @@
 
 // This file is included from all generated headers.
 
-#ifndef CAPNP_GENERATED_HEADER_SUPPORT_H_
-#define CAPNP_GENERATED_HEADER_SUPPORT_H_
-
-#if defined(__GNUC__) && !defined(CAPNP_HEADER_WARNINGS)
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "raw-schema.h"
 #include "layout.h"
@@ -36,6 +31,9 @@
 #include "any.h"
 #include <kj/string.h>
 #include <kj/string-tree.h>
+#include <kj/hash.h>
+
+CAPNP_BEGIN_HEADER
 
 namespace capnp {
 
@@ -404,4 +402,12 @@ inline constexpr uint sizeInWords() {
 
 #endif  // CAPNP_LITE, else
 
-#endif  // CAPNP_GENERATED_HEADER_SUPPORT_H_
+namespace capnp {
+namespace schemas {
+CAPNP_DECLARE_SCHEMA(995f9a3377c0b16e);
+// HACK: Forward-declare the RawSchema for StreamResult, from stream.capnp. This allows capnp
+//   files which declare streaming methods to avoid including stream.capnp.h.
+}
+}
+
+CAPNP_END_HEADER

@@ -19,14 +19,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_FILESYSTEM_H_
-#define KJ_FILESYSTEM_H_
+#pragma once
 
 #include "memory.h"
 #include "io.h"
 #include <inttypes.h>
-#include "time.h"  // TODO(now): problematic
+#include "time.h"
 #include "function.h"
+#include "hash.h"
 
 namespace kj {
 
@@ -97,14 +97,14 @@ public:
   // is NOT accepted -- if that is a problem, you probably want `eval()`. Trailing '/'s are
   // ignored.
 
-  Path append(Path suffix) const&;
-  Path append(Path suffix) &&;
+  Path append(Path&& suffix) const&;
+  Path append(Path&& suffix) &&;
   Path append(PathPtr suffix) const&;
   Path append(PathPtr suffix) &&;
   Path append(StringPtr suffix) const&;
   Path append(StringPtr suffix) &&;
-  Path append(String suffix) const&;
-  Path append(String suffix) &&;
+  Path append(String&& suffix) const&;
+  Path append(String&& suffix) &&;
   // Create a new path by appending the given path to this path.
   //
   // `suffix` cannot contain '/' characters. Instead, you can append an array:
@@ -149,19 +149,41 @@ public:
   Path slice(size_t start, size_t end) &&;
   // A Path can be accessed as an array of strings.
 
+  bool operator==(PathPtr other) const;
+  bool operator!=(PathPtr other) const;
+  bool operator< (PathPtr other) const;
+  bool operator> (PathPtr other) const;
+  bool operator<=(PathPtr other) const;
+  bool operator>=(PathPtr other) const;
+  // Compare path components lexically.
+
+  uint hashCode() const;
+  // Can use in HashMap.
+
+  bool startsWith(PathPtr prefix) const;
+  bool endsWith(PathPtr suffix) const;
+  // Compare prefix / suffix.
+
   Path evalWin32(StringPtr pathText) const&;
   Path evalWin32(StringPtr pathText) &&;
-  // Evaluates a Win32-style path. Differences from `eval()` include:
+  // Evaluates a Win32-style path, as might be written by a user. Differences from `eval()`
+  // include:
   //
   // - Backslashes can be used as path separators.
   // - Absolute paths begin with a drive letter followed by a colon. The drive letter, including
   //   the colon, will become the first component of the path, e.g. "c:\foo" becomes {"c:", "foo"}.
   // - A network path like "\\host\share\path" is parsed as {"host", "share", "path"}.
 
+  Path evalNative(StringPtr pathText) const&;
+  Path evalNative(StringPtr pathText) &&;
+  // Alias for either eval() or evalWin32() depending on the target platform. Use this when you are
+  // parsing a path provided by a user and you want the user to be able to use the "natural" format
+  // for their platform.
+
   String toWin32String(bool absolute = false) const;
-  // Converts the path to a Win32 path string.
+  // Converts the path to a Win32 path string, as you might display to a user.
   //
-  // (In most cases you'll want to further convert the returned string from UTF-8 to UTF-16.)
+  // This is meant for display. For making Win32 system calls, consider `toWin32Api()` instead.
   //
   // If `absolute` is true, the path is expected to be an absolute path, meaning the first
   // component is a drive letter, namespace, or network host name. These are converted to their
@@ -170,6 +192,29 @@ public:
   // This throws if the path would have unexpected special meaning or is otherwise invalid on
   // Windows, such as if it contains backslashes (within a path component), colons, or special
   // names like "con".
+
+  String toNativeString(bool absolute = false) const;
+  // Alias for either toString() or toWin32String() depending on the target platform. Use this when
+  // you are formatting a path to display to a user and you want to present it in the "natural"
+  // format for the user's platform.
+
+  Array<wchar_t> forWin32Api(bool absolute) const;
+  // Like toWin32String, but additionally:
+  // - Converts the path to UTF-16, with a NUL terminator included.
+  // - For absolute paths, adds the "\\?\" prefix which opts into permitting paths longer than
+  //   MAX_PATH, and turns off relative path processing (which KJ paths already handle in userspace
+  //   anyway).
+  //
+  // This method is good to use when making a Win32 API call, e.g.:
+  //
+  //     DeleteFileW(path.forWin32Api(true).begin());
+
+  static Path parseWin32Api(ArrayPtr<const wchar_t> text);
+  // Parses an absolute path as returned by a Win32 API call like GetFinalPathNameByHandle() or
+  // GetCurrentDirectory(). A "\\?\" prefix is optional but understood if present.
+  //
+  // Since such Win32 API calls generally return a length, this function inputs an array slice.
+  // The slice should not include any NUL terminator.
 
 private:
   Array<String> parts;
@@ -186,7 +231,7 @@ private:
   static void validatePart(StringPtr part);
   static void evalPart(Vector<String>& parts, ArrayPtr<const char> part);
   static Path evalImpl(Vector<String>&& parts, StringPtr path);
-  static Path evalWin32Impl(Vector<String>&& parts, StringPtr path);
+  static Path evalWin32Impl(Vector<String>&& parts, StringPtr path, bool fromApi = false);
   static size_t countParts(StringPtr path);
   static size_t countPartsWin32(StringPtr path);
   static bool isWin32Drive(ArrayPtr<const char> part);
@@ -204,10 +249,10 @@ public:
   PathPtr(const Path& path);
 
   Path clone();
-  Path append(Path suffix) const;
+  Path append(Path&& suffix) const;
   Path append(PathPtr suffix) const;
   Path append(StringPtr suffix) const;
-  Path append(String suffix) const;
+  Path append(String&& suffix) const;
   Path eval(StringPtr pathText) const;
   PathPtr basename() const;
   PathPtr parent() const;
@@ -217,14 +262,28 @@ public:
   const String* begin() const;
   const String* end() const;
   PathPtr slice(size_t start, size_t end) const;
+  bool operator==(PathPtr other) const;
+  bool operator!=(PathPtr other) const;
+  bool operator< (PathPtr other) const;
+  bool operator> (PathPtr other) const;
+  bool operator<=(PathPtr other) const;
+  bool operator>=(PathPtr other) const;
+  uint hashCode() const;
+  bool startsWith(PathPtr prefix) const;
+  bool endsWith(PathPtr suffix) const;
   Path evalWin32(StringPtr pathText) const;
+  Path evalNative(StringPtr pathText) const;
   String toWin32String(bool absolute = false) const;
+  String toNativeString(bool absolute = false) const;
+  Array<wchar_t> forWin32Api(bool absolute) const;
   // Equivalent to the corresponding methods of `Path`.
 
 private:
   ArrayPtr<const String> parts;
 
   explicit PathPtr(ArrayPtr<const String> parts);
+
+  String toWin32StringImpl(bool absolute, bool forApi) const;
 
   friend class Path;
 };
@@ -240,20 +299,28 @@ private:
 // slower than RAM (which is slower than L3 cache, which is slower than L2, which is slower than
 // L1). You can't do asynchronous RAM access so why asynchronous filesystem? The only way to
 // parallelize these is using threads.
+//
+// All KJ filesystem objects are thread-safe, and so all methods are marked "const" (even write
+// methods). Of course, if you concurrently write the same bytes of a file from multiple threads,
+// it's unspecified which write will "win".
 
 class FsNode {
   // Base class for filesystem node types.
 
 public:
-  Own<FsNode> clone();
+  Own<const FsNode> clone() const;
   // Creates a new object of exactly the same type as this one, pointing at exactly the same
   // external object.
   //
   // Under the hood, this will call dup(), so the FD number will not be the same.
 
-  virtual Maybe<int> getFd() = 0;
-  // Get the underlying file descriptor, if any. Returns nullptr if this object actually isn't
+  virtual Maybe<int> getFd() const { return nullptr; }
+  // Get the underlying Unix file descriptor, if any. Returns nullptr if this object actually isn't
   // wrapping a file descriptor.
+
+  virtual Maybe<void*> getWin32Handle() const { return nullptr; }
+  // Get the underlying Win32 HANDLE, if any. Returns nullptr if this object actually isn't
+  // wrapping a handle.
 
   enum class Type {
     FILE,
@@ -282,23 +349,44 @@ public:
     uint linkCount = 1;
     // Number of hard links pointing to this node.
 
+    uint64_t hashCode = 0;
+    // Hint which can be used to determine if two FsNode instances point to the same underlying
+    // file object. If two FsNodes report different hashCodes, then they are not the same object.
+    // If they report the same hashCode, then they may or may not be teh same object.
+    //
+    // The Unix filesystem implementation builds the hashCode based on st_dev and st_ino of
+    // `struct stat`. However, note that some filesystems -- especially FUSE-based -- may not fill
+    // in st_ino.
+    //
+    // The Windows filesystem implementation builds the hashCode based on dwVolumeSerialNumber and
+    // dwFileIndex{Low,High} of the BY_HANDLE_FILE_INFORMATION structure. However, these are again
+    // not guaranteed to be unique on all filesystems. In particular the documentation says that
+    // ReFS uses 128-bit identifiers which can't be represented here, and again virtual filesystems
+    // may often not report real identifiers.
+    //
+    // Of course, the process of hashing values into a single hash code can also cause collisions
+    // even if the filesystem reports reliable information.
+    //
+    // Additionally note that this value is not reliable when returned by `lstat()`. You should
+    // actually open the object, then call `stat()` on the opened object.
+
     // Not currently included:
-    // - Device / inode number: Rarely useful, and not safe to use in practice anyway.
     // - Access control info: Differs wildly across platforms, and KJ prefers capabilities anyway.
     // - Other timestamps: Differs across platforms.
     // - Device number: If you care, you're probably doing platform-specific stuff anyway.
 
     Metadata() = default;
-    Metadata(Type type, uint64_t size, uint64_t spaceUsed, Date lastModified, uint linkCount)
+    Metadata(Type type, uint64_t size, uint64_t spaceUsed, Date lastModified, uint linkCount,
+             uint64_t hashCode)
         : type(type), size(size), spaceUsed(spaceUsed), lastModified(lastModified),
-          linkCount(linkCount) {}
+          linkCount(linkCount), hashCode(hashCode) {}
     // TODO(cleanup): This constructor is redundant in C++14, but needed in C++11.
   };
 
-  virtual Metadata stat() = 0;
+  virtual Metadata stat() const = 0;
 
-  virtual void sync() = 0;
-  virtual void datasync() = 0;
+  virtual void sync() const = 0;
+  virtual void datasync() const = 0;
   // Maps to fsync() and fdatasync() system calls.
   //
   // Also, when creating or overwriting a file, the first call to sync() atomically links the file
@@ -307,29 +395,29 @@ public:
   // it.)
 
 protected:
-  virtual Own<FsNode> cloneFsNode() = 0;
+  virtual Own<const FsNode> cloneFsNode() const = 0;
   // Implements clone(). Required to return an object with exactly the same type as this one.
   // Hence, every subclass must implement this.
 };
 
 class ReadableFile: public FsNode {
 public:
-  Own<ReadableFile> clone();
+  Own<const ReadableFile> clone() const;
 
-  String readAllText();
+  String readAllText() const;
   // Read all text in the file and return as a big string.
 
-  Array<byte> readAllBytes();
+  Array<byte> readAllBytes() const;
   // Read all bytes in the file and return as a big byte array.
   //
   // This differs from mmap() in that the read is performed all at once. Future changes to the file
   // do not affect the returned copy. Consider using mmap() instead, particularly for large files.
 
-  virtual size_t read(uint64_t offset, ArrayPtr<byte> buffer) = 0;
+  virtual size_t read(uint64_t offset, ArrayPtr<byte> buffer) const = 0;
   // Fills `buffer` with data starting at `offset`. Returns the number of bytes actually read --
   // the only time this is less than `buffer.size()` is when EOF occurs mid-buffer.
 
-  virtual Array<const byte> mmap(uint64_t offset, uint64_t size) = 0;
+  virtual Array<const byte> mmap(uint64_t offset, uint64_t size) const = 0;
   // Maps the file to memory read-only. The returned array always has exactly the requested size.
   // Depending on the capabilities of the OS and filesystem, the mapping may or may not reflect
   // changes that happen to the file after mmap() returns.
@@ -343,7 +431,7 @@ public:
   // The returned array is always exactly the size requested. However, accessing bytes beyond the
   // current end of the file may raise SIGBUS, or may simply return zero.
 
-  virtual Array<byte> mmapPrivate(uint64_t offset, uint64_t size) = 0;
+  virtual Array<byte> mmapPrivate(uint64_t offset, uint64_t size) const = 0;
   // Like mmap() but returns a view that the caller can modify. Modifications will not be written
   // to the underlying file. Every call to this method returns a unique mapping. Changes made to
   // the underlying file by other clients may or may not be reflected in the mapping -- in fact,
@@ -356,59 +444,66 @@ public:
 
 class AppendableFile: public FsNode, public OutputStream {
 public:
-  Own<AppendableFile> clone();
+  Own<const AppendableFile> clone() const;
 
   // All methods are inherited.
 };
 
 class WritableFileMapping {
 public:
-  virtual ArrayPtr<byte> get() = 0;
+  virtual ArrayPtr<byte> get() const = 0;
   // Gets the mapped bytes. The returned array can be modified, and those changes may be written to
   // the underlying file, but there is no guarantee that they are written unless you subsequently
   // call changed().
 
-  virtual void changed(ArrayPtr<byte> slice) = 0;
+  virtual void changed(ArrayPtr<byte> slice) const = 0;
   // Notifies the implementation that the given bytes have changed. For some implementations this
   // may be a no-op while for others it may be necessary in order for the changes to be written
   // back at all.
   //
   // `slice` must be a slice of `bytes()`.
 
-  virtual void sync(ArrayPtr<byte> slice) = 0;
+  virtual void sync(ArrayPtr<byte> slice) const = 0;
   // Implies `changed()`, and then waits until the range has actually been written to disk before
   // returning.
   //
   // `slice` must be a slice of `bytes()`.
+  //
+  // On Windows, this calls FlushViewOfFile(). The documentation for this function implies that in
+  // some circumstances, to fully sync to physical disk, you may need to call FlushFileBuffers() on
+  // the file HANDLE as well. The documentation is not very clear on when and why this is needed.
+  // If you believe your program needs this, you can accomplish it by calling `.sync()` on the File
+  // object after calling `.sync()` on the WritableFileMapping.
 };
 
 class File: public ReadableFile {
 public:
-  Own<File> clone();
+  Own<const File> clone() const;
 
-  void writeAll(ArrayPtr<const byte> bytes);
-  void writeAll(StringPtr text);
+  void writeAll(ArrayPtr<const byte> bytes) const;
+  void writeAll(StringPtr text) const;
   // Completely replace the file with the given bytes or text.
 
-  virtual void write(uint64_t offset, ArrayPtr<const byte> data) = 0;
+  virtual void write(uint64_t offset, ArrayPtr<const byte> data) const = 0;
   // Write the given data starting at the given offset in the file.
 
-  virtual void zero(uint64_t offset, uint64_t size) = 0;
+  virtual void zero(uint64_t offset, uint64_t size) const = 0;
   // Write zeros to the file, starting at `offset` and continuing for `size` bytes. If the platform
   // supports it, this will "punch a hole" in the file, such that blocks that are entirely zeros
   // do not take space on disk.
 
-  virtual void truncate(uint64_t size) = 0;
+  virtual void truncate(uint64_t size) const = 0;
   // Set the file end pointer to `size`. If `size` is less than the current size, data past the end
   // is truncated. If `size` is larger than the current size, zeros are added to the end of the
   // file. If the platform supports it, blocks containing all-zeros will not be stored to disk.
 
-  virtual Own<WritableFileMapping> mmapWritable(uint64_t offset, uint64_t size) = 0;
+  virtual Own<const WritableFileMapping> mmapWritable(uint64_t offset, uint64_t size) const = 0;
   // Like ReadableFile::mmap() but returns a mapping for which any changes will be immediately
   // visible in other mappings of the file on the same system and will eventually be written back
   // to the file.
 
-  virtual size_t copy(uint64_t offset, ReadableFile& from, uint64_t fromOffset, uint64_t size);
+  virtual size_t copy(uint64_t offset, const ReadableFile& from, uint64_t fromOffset,
+                      uint64_t size) const;
   // Copies bytes from one file to another.
   //
   // Copies `size` bytes or to EOF, whichever comes first. Returns the number of bytes actually
@@ -424,9 +519,9 @@ class ReadableDirectory: public FsNode {
   // Read-only subset of `Directory`.
 
 public:
-  Own<ReadableDirectory> clone();
+  Own<const ReadableDirectory> clone() const;
 
-  virtual Array<String> listNames() = 0;
+  virtual Array<String> listNames() const = 0;
   // List the contents of this directory. Does NOT include "." nor "..".
 
   struct Entry {
@@ -440,38 +535,45 @@ public:
     // Convenience comparison operators to sort entries by name.
   };
 
-  virtual Array<Entry> listEntries() = 0;
+  virtual Array<Entry> listEntries() const = 0;
   // List the contents of the directory including the type of each file. On some platforms and
   // filesystems, this is just as fast as listNames(), but on others it may require stat()ing each
   // file.
 
-  virtual bool exists(PathPtr path) = 0;
+  virtual bool exists(PathPtr path) const = 0;
   // Does the specified path exist?
   //
   // If the path is a symlink, the symlink is followed and the return value indicates if the target
   // exists. If you want to know if the symlink exists, use lstat(). (This implies that listNames()
   // may return names for which exists() reports false.)
 
-  FsNode::Metadata lstat(PathPtr path);
-  virtual Maybe<FsNode::Metadata> tryLstat(PathPtr path) = 0;
+  FsNode::Metadata lstat(PathPtr path) const;
+  virtual Maybe<FsNode::Metadata> tryLstat(PathPtr path) const = 0;
   // Gets metadata about the path. If the path is a symlink, it is not followed -- the metadata
   // describes the symlink itself. `tryLstat()` returns null if the path doesn't exist.
 
-  Own<ReadableFile> openFile(PathPtr path);
-  virtual Maybe<Own<ReadableFile>> tryOpenFile(PathPtr path) = 0;
+  Own<const ReadableFile> openFile(PathPtr path) const;
+  virtual Maybe<Own<const ReadableFile>> tryOpenFile(PathPtr path) const = 0;
   // Open a file for reading.
   //
   // `tryOpenFile()` returns null if the path doesn't exist. Other errors still throw exceptions.
 
-  Own<ReadableDirectory> openSubdir(PathPtr path);
-  virtual Maybe<Own<ReadableDirectory>> tryOpenSubdir(PathPtr path) = 0;
+  Own<const ReadableDirectory> openSubdir(PathPtr path) const;
+  virtual Maybe<Own<const ReadableDirectory>> tryOpenSubdir(PathPtr path) const = 0;
   // Opens a subdirectory.
   //
   // `tryOpenSubdir()` returns null if the path doesn't exist. Other errors still throw exceptions.
 
-  String readlink(PathPtr path);
-  virtual Maybe<String> tryReadlink(PathPtr path) = 0;
+  String readlink(PathPtr path) const;
+  virtual Maybe<String> tryReadlink(PathPtr path) const = 0;
   // If `path` is a symlink, reads and returns the link contents.
+  //
+  // Note that tryReadlink() differs subtly from tryOpen*(). For example, tryOpenFile() throws if
+  // the path is not a file (e.g. if it's a directory); it only returns null if the path doesn't
+  // exist at all. tryReadlink() returns null if either the path doesn't exist, or if it does exist
+  // but isn't a symlink. This is because if it were to throw instead, then almost every real-world
+  // use case of tryReadlink() would be forced to perform an lstat() first for the sole purpose of
+  // checking if it is a link, wasting a syscall and a path traversal.
   //
   // See Directory::symlink() for warnings about symlinks.
 };
@@ -501,8 +603,6 @@ enum class WriteMode {
   CREATE = 1,
   // Create a new empty file.
   //
-  // This can be OR'd with MODIFY, but not with REPLACE.
-  //
   // When not combined with MODIFY, if the file already exists (including as a broken symlink),
   // tryOpenFile() returns null (and openFile() throws).
   //
@@ -512,8 +612,6 @@ enum class WriteMode {
 
   MODIFY = 2,
   // Modify an existing file.
-  //
-  // This can be OR'd with CREATE, but not with REPLACE.
   //
   // When not combined with CREATE, if the file doesn't exist (including if it is a broken symlink),
   // tryOpenFile() returns null (and openFile() throws).
@@ -590,14 +688,22 @@ class Directory: public ReadableDirectory {
   // A `Directory` object *only* provides access to children of the directory, not parents. That
   // is, you cannot open the file "..", nor jump to the root directory with "/".
   //
-  // On OSs that support in, a `Directory` is backed by an open handle to the directory node. This
+  // On OSs that support it, a `Directory` is backed by an open handle to the directory node. This
   // means:
   // - If the directory is renamed on-disk, the `Directory` object still points at it.
   // - Opening files in the directory only requires the OS to traverse the path from the directory
   //   to the file; it doesn't have to re-traverse all the way from the filesystem root.
+  //
+  // On Windows, a `Directory` object holds a lock on the underlying directory such that it cannot
+  // be renamed nor deleted while the object exists. This is necessary because Windows does not
+  // fully support traversing paths relative to file handles (it does for some operations but not
+  // all), so the KJ filesystem implementation is forced to remember the full path and needs to
+  // ensure that the path is not invalidated. If, in the future, Windows fully supports
+  // handle-relative paths, KJ may stop locking directories in this way, so do not rely on this
+  // behavior.
 
 public:
-  Own<Directory> clone();
+  Own<const Directory> clone() const;
 
   template <typename T>
   class Replacer {
@@ -625,7 +731,7 @@ public:
   public:
     explicit Replacer(WriteMode mode);
 
-    virtual T& get() = 0;
+    virtual const T& get() = 0;
     // Gets the File or Directory representing the replacement data. Fill in this object before
     // calling commit().
 
@@ -666,6 +772,11 @@ public:
     //   disappearing after the replacement (actually, a swap) has taken place. This differs from
     //   files, where a process that has opened a file before it is replaced will continue see the
     //   file's old content unchanged after the replacement.
+    // - On Windows, there are multiple ways to replace one file with another in a single system
+    //   call, but none are documented as being atomic. KJ always uses `MoveFileEx()` with
+    //   MOVEFILE_REPLACE_EXISTING. While the alternative `ReplaceFile()` is attractive for many
+    //   reasons, it has the critical problem that it cannot be used when the source file has open
+    //   file handles, which is generally the case when using Replacer.
 
   protected:
     const WriteMode mode;
@@ -676,45 +787,45 @@ public:
   using ReadableDirectory::tryOpenFile;
   using ReadableDirectory::tryOpenSubdir;
 
-  Own<File> openFile(PathPtr path, WriteMode mode);
-  virtual Maybe<Own<File>> tryOpenFile(PathPtr path, WriteMode mode) = 0;
+  Own<const File> openFile(PathPtr path, WriteMode mode) const;
+  virtual Maybe<Own<const File>> tryOpenFile(PathPtr path, WriteMode mode) const = 0;
   // Open a file for writing.
   //
   // `tryOpenFile()` returns null if the path is required to exist but doesn't (MODIFY or REPLACE)
   // or if the path is required not to exist but does (CREATE or RACE).
 
-  virtual Own<Replacer<File>> replaceFile(PathPtr path, WriteMode mode) = 0;
+  virtual Own<Replacer<File>> replaceFile(PathPtr path, WriteMode mode) const = 0;
   // Construct a file which, when ready, will be atomically moved to `path`, replacing whatever
   // is there already. See `Replacer<T>` for detalis.
   //
   // The `CREATE` and `MODIFY` bits of `mode` are not enforced until commit time, hence
   // `replaceFile()` has no "try" variant.
 
-  virtual Own<File> createTemporary() = 0;
+  virtual Own<const File> createTemporary() const = 0;
   // Create a temporary file backed by this directory's filesystem, but which isn't linked into
   // the directory tree. The file is deleted from disk when all references to it have been dropped.
 
-  Own<AppendableFile> appendFile(PathPtr path, WriteMode mode);
-  virtual Maybe<Own<AppendableFile>> tryAppendFile(PathPtr path, WriteMode mode) = 0;
+  Own<AppendableFile> appendFile(PathPtr path, WriteMode mode) const;
+  virtual Maybe<Own<AppendableFile>> tryAppendFile(PathPtr path, WriteMode mode) const = 0;
   // Opens the file for appending only. Useful for log files.
   //
   // If the underlying filesystem supports it, writes to the file will always be appended even if
   // other writers are writing to the same file at the same time -- however, some implementations
   // may instead assume that no other process is changing the file size between writes.
 
-  Own<Directory> openSubdir(PathPtr path, WriteMode mode);
-  virtual Maybe<Own<Directory>> tryOpenSubdir(PathPtr path, WriteMode mode) = 0;
+  Own<const Directory> openSubdir(PathPtr path, WriteMode mode) const;
+  virtual Maybe<Own<const Directory>> tryOpenSubdir(PathPtr path, WriteMode mode) const = 0;
   // Opens a subdirectory for writing.
 
-  virtual Own<Replacer<Directory>> replaceSubdir(PathPtr path, WriteMode mode) = 0;
+  virtual Own<Replacer<Directory>> replaceSubdir(PathPtr path, WriteMode mode) const = 0;
   // Construct a directory which, when ready, will be atomically moved to `path`, replacing
   // whatever is there already. See `Replacer<T>` for detalis.
   //
   // The `CREATE` and `MODIFY` bits of `mode` are not enforced until commit time, hence
   // `replaceSubdir()` has no "try" variant.
 
-  void symlink(PathPtr linkpath, StringPtr content, WriteMode mode);
-  virtual bool trySymlink(PathPtr linkpath, StringPtr content, WriteMode mode) = 0;
+  void symlink(PathPtr linkpath, StringPtr content, WriteMode mode) const;
+  virtual bool trySymlink(PathPtr linkpath, StringPtr content, WriteMode mode) const = 0;
   // Create a symlink. `content` is the raw text which will be written into the symlink node.
   // How this text is interpreted is entirely dependent on the filesystem. Note in particular that:
   // - Windows will require a path that uses backslashes as the separator.
@@ -729,15 +840,15 @@ public:
   // exists.
 
   void transfer(PathPtr toPath, WriteMode toMode,
-                PathPtr fromPath, TransferMode mode);
+                PathPtr fromPath, TransferMode mode) const;
   void transfer(PathPtr toPath, WriteMode toMode,
-                Directory& fromDirectory, PathPtr fromPath,
-                TransferMode mode);
+                const Directory& fromDirectory, PathPtr fromPath,
+                TransferMode mode) const;
   virtual bool tryTransfer(PathPtr toPath, WriteMode toMode,
-                           Directory& fromDirectory, PathPtr fromPath,
-                           TransferMode mode);
-  virtual Maybe<bool> tryTransferTo(Directory& toDirectory, PathPtr toPath, WriteMode toMode,
-                                    PathPtr fromPath, TransferMode mode);
+                           const Directory& fromDirectory, PathPtr fromPath,
+                           TransferMode mode) const;
+  virtual Maybe<bool> tryTransferTo(const Directory& toDirectory, PathPtr toPath, WriteMode toMode,
+                                    PathPtr fromPath, TransferMode mode) const;
   // Move, link, or copy a file/directory tree from one location to another.
   //
   // Filesystems vary in what kinds of transfers are allowed, especially for TransferMode::LINK,
@@ -754,8 +865,8 @@ public:
   // `toMode` controls how the target path is created. CREATE_PARENT is honored but EXECUTABLE and
   // PRIVATE have no effect.
 
-  void remove(PathPtr path);
-  virtual bool tryRemove(PathPtr path) = 0;
+  void remove(PathPtr path) const;
+  virtual bool tryRemove(PathPtr path) const = 0;
   // Deletes/unlinks the given path. If the path names a directory, it is recursively deleted.
   //
   // tryRemove() returns false if the path doesn't exist; remove() throws in this case.
@@ -780,13 +891,13 @@ private:
 
 class Filesystem {
 public:
-  virtual Directory& getRoot() = 0;
+  virtual const Directory& getRoot() const = 0;
   // Get the filesystem's root directory, as of the time the Filesystem object was created.
 
-  virtual Directory& getCurrent() = 0;
+  virtual const Directory& getCurrent() const = 0;
   // Get the filesystem's current directory, as of the time the Filesystem object was created.
 
-  virtual PathPtr getCurrentPath() = 0;
+  virtual PathPtr getCurrentPath() const = 0;
   // Get the path from the root to the current directory, as of the time the Filesystem object was
   // created. Note that because a `Directory` does not provide access to its parent, if you want to
   // follow `..` from the current directory, you must use `getCurrentPath().eval("..")` or
@@ -807,8 +918,8 @@ public:
 
 // =======================================================================================
 
-Own<File> newInMemoryFile(Clock& clock);
-Own<Directory> newInMemoryDirectory(Clock& clock);
+Own<File> newInMemoryFile(const Clock& clock);
+Own<Directory> newInMemoryDirectory(const Clock& clock);
 // Construct file and directory objects which reside in-memory.
 //
 // InMemoryFile has the following special properties:
@@ -823,18 +934,24 @@ Own<Directory> newInMemoryDirectory(Clock& clock);
 // - link() and rename() accept any kind of Directory as `fromDirectory` -- it doesn't need to be
 //   another InMemoryDirectory. However, for rename(), the from path must be a directory.
 
-Own<AppendableFile> newFileAppender(Own<File> inner);
+Own<AppendableFile> newFileAppender(Own<const File> inner);
 // Creates an AppendableFile by wrapping a File. Note that this implementation assumes it is the
 // only writer. A correct implementation should always append to the file even if other writes
 // are happening simultaneously, as is achieved with the O_APPEND flag to open(2), but that
 // behavior is not possible to emulate on top of `File`.
 
-Own<ReadableFile> newDiskReadableFile(kj::AutoCloseFd fd);
-Own<AppendableFile> newDiskAppendableFile(kj::AutoCloseFd fd);
-Own<File> newDiskFile(kj::AutoCloseFd fd);
-Own<ReadableDirectory> newDiskReadableDirectory(kj::AutoCloseFd fd);
-Own<Directory> newDiskDirectory(kj::AutoCloseFd fd);
-// Wrap a file descriptor as various filesystem types.
+#if _WIN32
+typedef AutoCloseHandle OsFileHandle;
+#else
+typedef AutoCloseFd OsFileHandle;
+#endif
+
+Own<ReadableFile> newDiskReadableFile(OsFileHandle fd);
+Own<AppendableFile> newDiskAppendableFile(OsFileHandle fd);
+Own<File> newDiskFile(OsFileHandle fd);
+Own<ReadableDirectory> newDiskReadableDirectory(OsFileHandle fd);
+Own<Directory> newDiskDirectory(OsFileHandle fd);
+// Wrap a file descriptor (or Windows HANDLE) as various filesystem types.
 
 Own<Filesystem> newDiskFilesystem();
 // Get at implementation of `Filesystem` representing the real filesystem.
@@ -856,12 +973,12 @@ inline Path::Path(std::initializer_list<StringPtr> parts)
 inline Path::Path(Array<String> parts, decltype(ALREADY_CHECKED))
     : parts(kj::mv(parts)) {}
 inline Path Path::clone() const { return PathPtr(*this).clone(); }
-inline Path Path::append(Path suffix) const& { return PathPtr(*this).append(kj::mv(suffix)); }
+inline Path Path::append(Path&& suffix) const& { return PathPtr(*this).append(kj::mv(suffix)); }
 inline Path Path::append(PathPtr suffix) const& { return PathPtr(*this).append(suffix); }
 inline Path Path::append(StringPtr suffix) const& { return append(Path(suffix)); }
 inline Path Path::append(StringPtr suffix) && { return kj::mv(*this).append(Path(suffix)); }
-inline Path Path::append(String suffix) const& { return append(Path(kj::mv(suffix))); }
-inline Path Path::append(String suffix) && { return kj::mv(*this).append(Path(kj::mv(suffix))); }
+inline Path Path::append(String&& suffix) const& { return append(Path(kj::mv(suffix))); }
+inline Path Path::append(String&& suffix) && { return kj::mv(*this).append(Path(kj::mv(suffix))); }
 inline Path Path::eval(StringPtr pathText) const& { return PathPtr(*this).eval(pathText); }
 inline PathPtr Path::basename() const& { return PathPtr(*this).basename(); }
 inline PathPtr Path::parent() const& { return PathPtr(*this).parent(); }
@@ -873,6 +990,15 @@ inline const String* Path::end() const { return parts.end(); }
 inline PathPtr Path::slice(size_t start, size_t end) const& {
   return PathPtr(*this).slice(start, end);
 }
+inline bool Path::operator==(PathPtr other) const { return PathPtr(*this) == other; }
+inline bool Path::operator!=(PathPtr other) const { return PathPtr(*this) != other; }
+inline bool Path::operator< (PathPtr other) const { return PathPtr(*this) <  other; }
+inline bool Path::operator> (PathPtr other) const { return PathPtr(*this) >  other; }
+inline bool Path::operator<=(PathPtr other) const { return PathPtr(*this) <= other; }
+inline bool Path::operator>=(PathPtr other) const { return PathPtr(*this) >= other; }
+inline uint Path::hashCode() const { return kj::hashCode(parts); }
+inline bool Path::startsWith(PathPtr prefix) const { return PathPtr(*this).startsWith(prefix); }
+inline bool Path::endsWith  (PathPtr suffix) const { return PathPtr(*this).endsWith  (suffix); }
 inline String Path::toString(bool absolute) const { return PathPtr(*this).toString(absolute); }
 inline Path Path::evalWin32(StringPtr pathText) const& {
   return PathPtr(*this).evalWin32(pathText);
@@ -880,12 +1006,15 @@ inline Path Path::evalWin32(StringPtr pathText) const& {
 inline String Path::toWin32String(bool absolute) const {
   return PathPtr(*this).toWin32String(absolute);
 }
+inline Array<wchar_t> Path::forWin32Api(bool absolute) const {
+  return PathPtr(*this).forWin32Api(absolute);
+}
 
 inline PathPtr::PathPtr(decltype(nullptr)): parts(nullptr) {}
 inline PathPtr::PathPtr(const Path& path): parts(path.parts) {}
 inline PathPtr::PathPtr(ArrayPtr<const String> parts): parts(parts) {}
 inline Path PathPtr::append(StringPtr suffix) const { return append(Path(suffix)); }
-inline Path PathPtr::append(String suffix) const { return append(Path(kj::mv(suffix))); }
+inline Path PathPtr::append(String&& suffix) const { return append(Path(kj::mv(suffix))); }
 inline const String& PathPtr::operator[](size_t i) const { return parts[i]; }
 inline size_t PathPtr::size() const { return parts.size(); }
 inline const String* PathPtr::begin() const { return parts.begin(); }
@@ -893,20 +1022,66 @@ inline const String* PathPtr::end() const { return parts.end(); }
 inline PathPtr PathPtr::slice(size_t start, size_t end) const {
   return PathPtr(parts.slice(start, end));
 }
+inline bool PathPtr::operator!=(PathPtr other) const { return !(*this == other); }
+inline bool PathPtr::operator> (PathPtr other) const { return other < *this; }
+inline bool PathPtr::operator<=(PathPtr other) const { return !(other < *this); }
+inline bool PathPtr::operator>=(PathPtr other) const { return !(*this < other); }
+inline uint PathPtr::hashCode() const { return kj::hashCode(parts); }
+inline String PathPtr::toWin32String(bool absolute) const {
+  return toWin32StringImpl(absolute, false);
+}
 
-inline Own<FsNode> FsNode::clone() { return cloneFsNode().downcast<FsNode>(); }
-inline Own<ReadableFile> ReadableFile::clone() { return cloneFsNode().downcast<ReadableFile>(); }
-inline Own<AppendableFile> AppendableFile::clone() {
-  return cloneFsNode().downcast<AppendableFile>();
+#if _WIN32
+inline Path Path::evalNative(StringPtr pathText) const& {
+  return evalWin32(pathText);
 }
-inline Own<File> File::clone() { return cloneFsNode().downcast<File>(); }
-inline Own<ReadableDirectory> ReadableDirectory::clone() {
-  return cloneFsNode().downcast<ReadableDirectory>();
+inline Path Path::evalNative(StringPtr pathText) && {
+  return kj::mv(*this).evalWin32(pathText);
 }
-inline Own<Directory> Directory::clone() { return cloneFsNode().downcast<Directory>(); }
+inline String Path::toNativeString(bool absolute) const {
+  return toWin32String(absolute);
+}
+inline Path PathPtr::evalNative(StringPtr pathText) const {
+  return evalWin32(pathText);
+}
+inline String PathPtr::toNativeString(bool absolute) const {
+  return toWin32String(absolute);
+}
+#else
+inline Path Path::evalNative(StringPtr pathText) const& {
+  return eval(pathText);
+}
+inline Path Path::evalNative(StringPtr pathText) && {
+  return kj::mv(*this).eval(pathText);
+}
+inline String Path::toNativeString(bool absolute) const {
+  return toString(absolute);
+}
+inline Path PathPtr::evalNative(StringPtr pathText) const {
+  return eval(pathText);
+}
+inline String PathPtr::toNativeString(bool absolute) const {
+  return toString(absolute);
+}
+#endif  // _WIN32, else
+
+inline Own<const FsNode> FsNode::clone() const { return cloneFsNode(); }
+inline Own<const ReadableFile> ReadableFile::clone() const {
+  return cloneFsNode().downcast<const ReadableFile>();
+}
+inline Own<const AppendableFile> AppendableFile::clone() const {
+  return cloneFsNode().downcast<const AppendableFile>();
+}
+inline Own<const File> File::clone() const { return cloneFsNode().downcast<const File>(); }
+inline Own<const ReadableDirectory> ReadableDirectory::clone() const {
+  return cloneFsNode().downcast<const ReadableDirectory>();
+}
+inline Own<const Directory> Directory::clone() const {
+  return cloneFsNode().downcast<const Directory>();
+}
 
 inline void Directory::transfer(
-    PathPtr toPath, WriteMode toMode, PathPtr fromPath, TransferMode mode) {
+    PathPtr toPath, WriteMode toMode, PathPtr fromPath, TransferMode mode) const {
   return transfer(toPath, toMode, *this, fromPath, mode);
 }
 
@@ -919,5 +1094,3 @@ void Directory::Replacer<T>::commit() {
 }
 
 } // namespace kj
-
-#endif // KJ_FILESYSTEM_H_

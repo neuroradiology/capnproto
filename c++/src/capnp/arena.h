@@ -19,12 +19,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef CAPNP_ARENA_H_
-#define CAPNP_ARENA_H_
-
-#if defined(__GNUC__) && !defined(CAPNP_HEADER_WARNINGS)
-#pragma GCC system_header
-#endif
+#pragma once
 
 #ifndef CAPNP_PRIVATE
 #error "This header is only meant to be included by Cap'n Proto's own source code."
@@ -38,11 +33,13 @@
 #include "common.h"
 #include "message.h"
 #include "layout.h"
-#include <unordered_map>
+#include <kj/map.h>
 
 #if !CAPNP_LITE
 #include "capability.h"
 #endif  // !CAPNP_LITE
+
+CAPNP_BEGIN_HEADER
 
 namespace capnp {
 
@@ -231,6 +228,8 @@ public:
   ~ReaderArena() noexcept(false);
   KJ_DISALLOW_COPY(ReaderArena);
 
+  size_t sizeInWords();
+
   // implements Arena ------------------------------------------------
   SegmentReader* tryGetSegment(SegmentId id) override;
   void reportReadLimitReached() override;
@@ -242,8 +241,8 @@ private:
   // Optimize for single-segment messages so that small messages are handled quickly.
   SegmentReader segment0;
 
-  typedef std::unordered_map<uint, kj::Own<SegmentReader>> SegmentMap;
-  kj::MutexGuarded<kj::Maybe<kj::Own<SegmentMap>>> moreSegments;
+  typedef kj::HashMap<uint, kj::Own<SegmentReader>> SegmentMap;
+  kj::MutexGuarded<kj::Maybe<SegmentMap>> moreSegments;
   // We need to mutex-guard the segment map because we lazily initialize segments when they are
   // first requested, but a Reader is allowed to be used concurrently in multiple threads.  Luckily
   // this only applies to large messages.
@@ -264,6 +263,8 @@ public:
   BuilderArena(MessageBuilder* message, kj::ArrayPtr<MessageBuilder::SegmentInit> segments);
   ~BuilderArena() noexcept(false);
   KJ_DISALLOW_COPY(BuilderArena);
+
+  size_t sizeInWords();
 
   inline SegmentBuilder* getRootSegment() { return &segment0; }
 
@@ -287,6 +288,10 @@ public:
     //   deprecate this usage and instead define a new helper type for this exact purpose.
 
     return &localCapTable;
+  }
+
+  kj::Own<_::CapTableBuilder> releaseLocalCapTable() {
+    return kj::heap<LocalCapTable>(kj::mv(localCapTable));
   }
 
   SegmentBuilder* getSegment(SegmentId id);
@@ -322,7 +327,7 @@ private:
   MessageBuilder* message;
   ReadLimiter dummyLimiter;
 
-  class LocalCapTable: public CapTableBuilder {
+  class LocalCapTable final: public CapTableBuilder {
 #if !CAPNP_LITE
   public:
     kj::Maybe<kj::Own<ClientHook>> extractCap(uint index) override;
@@ -493,4 +498,4 @@ inline bool SegmentBuilder::tryExtend(word* from, word* to) {
 }  // namespace _ (private)
 }  // namespace capnp
 
-#endif  // CAPNP_ARENA_H_
+CAPNP_END_HEADER

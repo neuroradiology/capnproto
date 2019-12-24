@@ -19,16 +19,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_EXCEPTION_H_
-#define KJ_EXCEPTION_H_
-
-#if defined(__GNUC__) && !KJ_HEADER_WARNINGS
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "memory.h"
 #include "array.h"
 #include "string.h"
+#include "windows-sanity.h"  // work-around macro conflict with `ERROR`
+
+KJ_BEGIN_HEADER
 
 namespace kj {
 
@@ -355,6 +353,7 @@ String stringifyStackTrace(ArrayPtr<void* const>);
 // suprocesses.
 
 String stringifyStackTraceAddresses(ArrayPtr<void* const> trace);
+StringPtr stringifyStackTraceAddresses(ArrayPtr<void* const> trace, ArrayPtr<char> scratch);
 // Construct a string containing just enough information about a stack trace to be able to convert
 // it to file and line numbers later using offline tools. This produces a sequence of
 // space-separated code location identifiers. Each identifier may be an absolute address
@@ -374,6 +373,12 @@ kj::StringPtr trimSourceFilename(kj::StringPtr filename);
 // Given a source code file name, trim off noisy prefixes like "src/" or
 // "/ekam-provider/canonical/".
 
+kj::String getCaughtExceptionType();
+// Utility function which attempts to return the human-readable type name of the exception
+// currently being thrown. This can be called inside a catch block, including a catch (...) block,
+// for the purpose of error logging. This function is best-effort; on some platforms it may simply
+// return "(unknown)".
+
 }  // namespace kj
 
-#endif  // KJ_EXCEPTION_H_
+KJ_END_HEADER

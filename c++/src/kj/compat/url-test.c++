@@ -26,12 +26,26 @@
 namespace kj {
 namespace {
 
-Url parseAndCheck(kj::StringPtr originalText, kj::StringPtr expectedRestringified = nullptr) {
+Url parseAndCheck(kj::StringPtr originalText, kj::StringPtr expectedRestringified = nullptr,
+                  Url::Options options = {}) {
   if (expectedRestringified == nullptr) expectedRestringified = originalText;
-  auto url = Url::parse(originalText);
+  auto url = Url::parse(originalText, Url::REMOTE_HREF, options);
   KJ_EXPECT(kj::str(url) == expectedRestringified, url, originalText, expectedRestringified);
+  // Make sure clones also restringify to the expected string.
+  auto clone = url.clone();
+  KJ_EXPECT(kj::str(clone) == expectedRestringified, clone, originalText, expectedRestringified);
   return url;
 }
+
+static constexpr Url::Options NO_DECODE {
+  false,  // percentDecode
+  false,  // allowEmpty
+};
+
+static constexpr Url::Options ALLOW_EMPTY {
+  true,    // percentDecode
+  true,    // allowEmpty
+};
 
 KJ_TEST("parse / stringify URL") {
   {
@@ -105,6 +119,36 @@ KJ_TEST("parse / stringify URL") {
   }
 
   {
+    auto url = parseAndCheck("https://capnproto.org/foo/bar?baz=qux&corge=#garply");
+    KJ_EXPECT(url.scheme == "https");
+    KJ_EXPECT(url.userInfo == nullptr);
+    KJ_EXPECT(url.host == "capnproto.org");
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>({"foo", "bar"}));
+    KJ_EXPECT(!url.hasTrailingSlash);
+    KJ_ASSERT(url.query.size() == 2);
+    KJ_EXPECT(url.query[0].name == "baz");
+    KJ_EXPECT(url.query[0].value == "qux");
+    KJ_EXPECT(url.query[1].name == "corge");
+    KJ_EXPECT(url.query[1].value == nullptr);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(url.fragment) == "garply");
+  }
+
+  {
+    auto url = parseAndCheck("https://capnproto.org/foo/bar?baz=&corge=grault#garply");
+    KJ_EXPECT(url.scheme == "https");
+    KJ_EXPECT(url.userInfo == nullptr);
+    KJ_EXPECT(url.host == "capnproto.org");
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>({"foo", "bar"}));
+    KJ_EXPECT(!url.hasTrailingSlash);
+    KJ_ASSERT(url.query.size() == 2);
+    KJ_EXPECT(url.query[0].name == "baz");
+    KJ_EXPECT(url.query[0].value == "");
+    KJ_EXPECT(url.query[1].name == "corge");
+    KJ_EXPECT(url.query[1].value == "grault");
+    KJ_EXPECT(KJ_ASSERT_NONNULL(url.fragment) == "garply");
+  }
+
+  {
     auto url = parseAndCheck("https://capnproto.org/foo/bar/?baz=qux&corge=grault#garply");
     KJ_EXPECT(url.scheme == "https");
     KJ_EXPECT(url.userInfo == nullptr);
@@ -130,6 +174,14 @@ KJ_TEST("parse / stringify URL") {
     KJ_EXPECT(url.query[0].name == "baz");
     KJ_EXPECT(url.query[0].value == "qux");
     KJ_EXPECT(KJ_ASSERT_NONNULL(url.fragment) == "garply");
+  }
+
+  {
+    auto url = parseAndCheck("https://capnproto.org/foo?bar%20baz=qux+quux",
+                             "https://capnproto.org/foo?bar+baz=qux+quux");
+    KJ_ASSERT(url.query.size() == 1);
+    KJ_EXPECT(url.query[0].name == "bar baz");
+    KJ_EXPECT(url.query[0].value == "qux quux");
   }
 
   {
@@ -190,11 +242,11 @@ KJ_TEST("parse / stringify URL") {
   }
 
   {
-    auto url = parseAndCheck("https://foo:1234@capnproto.org");
+    auto url = parseAndCheck("https://$foo&:12+,34@capnproto.org");
     KJ_EXPECT(url.scheme == "https");
     auto& user = KJ_ASSERT_NONNULL(url.userInfo);
-    KJ_EXPECT(user.username == "foo");
-    KJ_EXPECT(KJ_ASSERT_NONNULL(user.password) == "1234");
+    KJ_EXPECT(user.username == "$foo&");
+    KJ_EXPECT(KJ_ASSERT_NONNULL(user.password) == "12+,34");
     KJ_EXPECT(url.host == "capnproto.org");
     KJ_EXPECT(url.path == nullptr);
     KJ_EXPECT(!url.hasTrailingSlash);
@@ -213,12 +265,47 @@ KJ_TEST("parse / stringify URL") {
     KJ_EXPECT(url.fragment == nullptr);
   }
 
+  {
+    auto url = parseAndCheck("https://capnproto.org/foo%2Fbar/baz");
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>({"foo/bar", "baz"}));
+  }
+
   parseAndCheck("https://capnproto.org/foo/bar?", "https://capnproto.org/foo/bar");
   parseAndCheck("https://capnproto.org/foo/bar?#", "https://capnproto.org/foo/bar#");
   parseAndCheck("https://capnproto.org/foo/bar#");
 
   // Scheme and host are forced to lower-case.
   parseAndCheck("hTtP://capNprotO.org/fOo/bAr", "http://capnproto.org/fOo/bAr");
+
+  // URLs with underscores in their hostnames are allowed, but you probably shouldn't use them. They
+  // are not valid domain names.
+  parseAndCheck("https://bad_domain.capnproto.org/");
+
+  // Make sure URLs with %-encoded '%' signs in their userinfo, path, query, and fragment components
+  // get correctly re-encoded.
+  parseAndCheck("https://foo%25bar:baz%25qux@capnproto.org/");
+  parseAndCheck("https://capnproto.org/foo%25bar");
+  parseAndCheck("https://capnproto.org/?foo%25bar=baz%25qux");
+  parseAndCheck("https://capnproto.org/#foo%25bar");
+
+  // Make sure redundant /'s and &'s aren't collapsed when options.removeEmpty is false.
+  parseAndCheck("https://capnproto.org/foo//bar///test//?foo=bar&&baz=qux&", nullptr, ALLOW_EMPTY);
+
+  // "." and ".." are still processed, though.
+  parseAndCheck("https://capnproto.org/foo//../bar/.",
+                "https://capnproto.org/foo/bar/", ALLOW_EMPTY);
+
+  {
+    auto url = parseAndCheck("https://foo/", nullptr, ALLOW_EMPTY);
+    KJ_EXPECT(url.path.size() == 0);
+    KJ_EXPECT(url.hasTrailingSlash);
+  }
+
+  {
+    auto url = parseAndCheck("https://foo/bar/", nullptr, ALLOW_EMPTY);
+    KJ_EXPECT(url.path.size() == 1);
+    KJ_EXPECT(url.hasTrailingSlash);
+  }
 }
 
 KJ_TEST("URL percent encoding") {
@@ -232,7 +319,35 @@ KJ_TEST("URL percent encoding") {
 
   parseAndCheck(
       "https://b b: bcd@capnproto.org/f o?b r=b z#q x",
-      "https://b%20b:%20bcd@capnproto.org/f%20o?b%20r=b%20z#q%20x");
+      "https://b%20b:%20bcd@capnproto.org/f%20o?b+r=b+z#q%20x");
+
+  parseAndCheck(
+      "https://capnproto.org/foo?bar=baz#@?#^[\\]{|}",
+      "https://capnproto.org/foo?bar=baz#@?#^[\\]{|}");
+
+  // All permissible non-alphanumeric, non-separator path characters.
+  parseAndCheck(
+      "https://capnproto.org/!$&'()*+,-.:;=@[]^_|~",
+      "https://capnproto.org/!$&'()*+,-.:;=@[]^_|~");
+}
+
+KJ_TEST("parse / stringify URL w/o decoding") {
+  {
+    auto url = parseAndCheck("https://capnproto.org/foo%2Fbar/baz", nullptr, NO_DECODE);
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>({"foo%2Fbar", "baz"}));
+  }
+
+  {
+    // This case would throw an exception without NO_DECODE.
+    Url url = parseAndCheck("https://capnproto.org/R%20%26%20S?%foo=%QQ", nullptr, NO_DECODE);
+    KJ_EXPECT(url.scheme == "https");
+    KJ_EXPECT(url.host == "capnproto.org");
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>({"R%20%26%20S"}));
+    KJ_EXPECT(!url.hasTrailingSlash);
+    KJ_ASSERT(url.query.size() == 1);
+    KJ_EXPECT(url.query[0].name == "%foo");
+    KJ_EXPECT(url.query[0].value == "%QQ");
+  }
 }
 
 KJ_TEST("URL relative paths") {
@@ -310,6 +425,58 @@ KJ_TEST("URL for HTTP request") {
     KJ_EXPECT(url.query[1].name == "corge");
     KJ_EXPECT(url.query[1].value == nullptr);
   }
+
+  {
+    // '#' is allowed in path components in the HTTP_REQUEST context.
+    Url url = Url::parse("/foo#bar", Url::HTTP_REQUEST);
+    KJ_EXPECT(url.toString(Url::HTTP_REQUEST) == "/foo%23bar");
+    KJ_EXPECT(url.scheme == nullptr);
+    KJ_EXPECT(url.host == nullptr);
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>{"foo#bar"});
+    KJ_EXPECT(!url.hasTrailingSlash);
+    KJ_EXPECT(url.query == nullptr);
+    KJ_EXPECT(url.fragment == nullptr);
+  }
+
+  {
+    // '#' is allowed in path components in the HTTP_PROXY_REQUEST context.
+    Url url = Url::parse("https://capnproto.org/foo#bar", Url::HTTP_PROXY_REQUEST);
+    KJ_EXPECT(url.toString(Url::HTTP_PROXY_REQUEST) == "https://capnproto.org/foo%23bar");
+    KJ_EXPECT(url.scheme == "https");
+    KJ_EXPECT(url.host == "capnproto.org");
+    KJ_EXPECT(url.path.asPtr() == kj::ArrayPtr<const StringPtr>{"foo#bar"});
+    KJ_EXPECT(!url.hasTrailingSlash);
+    KJ_EXPECT(url.query == nullptr);
+    KJ_EXPECT(url.fragment == nullptr);
+  }
+
+  {
+    // '#' is allowed in query components in the HTTP_REQUEST context.
+    Url url = Url::parse("/?foo=bar#123", Url::HTTP_REQUEST);
+    KJ_EXPECT(url.toString(Url::HTTP_REQUEST) == "/?foo=bar%23123");
+    KJ_EXPECT(url.scheme == nullptr);
+    KJ_EXPECT(url.host == nullptr);
+    KJ_EXPECT(url.path == nullptr);
+    KJ_EXPECT(url.hasTrailingSlash);
+    KJ_ASSERT(url.query.size() == 1);
+    KJ_EXPECT(url.query[0].name == "foo");
+    KJ_EXPECT(url.query[0].value == "bar#123");
+    KJ_EXPECT(url.fragment == nullptr);
+  }
+
+  {
+    // '#' is allowed in query components in the HTTP_PROXY_REQUEST context.
+    Url url = Url::parse("https://capnproto.org/?foo=bar#123", Url::HTTP_PROXY_REQUEST);
+    KJ_EXPECT(url.toString(Url::HTTP_PROXY_REQUEST) == "https://capnproto.org/?foo=bar%23123");
+    KJ_EXPECT(url.scheme == "https");
+    KJ_EXPECT(url.host == "capnproto.org");
+    KJ_EXPECT(url.path == nullptr);
+    KJ_EXPECT(url.hasTrailingSlash);
+    KJ_ASSERT(url.query.size() == 1);
+    KJ_EXPECT(url.query[0].name == "foo");
+    KJ_EXPECT(url.query[0].value == "bar#123");
+    KJ_EXPECT(url.fragment == nullptr);
+  }
 }
 
 KJ_TEST("parse URL failure") {
@@ -323,23 +490,37 @@ KJ_TEST("parse URL failure") {
 
   // components not valid in context
   KJ_EXPECT(Url::tryParse("https://capnproto.org/foo", Url::HTTP_REQUEST) == nullptr);
-  KJ_EXPECT(Url::tryParse("/foo#bar", Url::HTTP_REQUEST) == nullptr);
   KJ_EXPECT(Url::tryParse("https://bob:123@capnproto.org/foo", Url::HTTP_PROXY_REQUEST) == nullptr);
-  KJ_EXPECT(Url::tryParse("https://capnproto.org/foo#bar", Url::HTTP_PROXY_REQUEST) == nullptr);
+  KJ_EXPECT(Url::tryParse("https://capnproto.org#/foo", Url::HTTP_PROXY_REQUEST) == nullptr);
 }
 
-void parseAndCheckRelative(kj::StringPtr base, kj::StringPtr relative, kj::StringPtr expected) {
-  auto parsed = Url::parse(base).parseRelative(relative);
+void parseAndCheckRelative(kj::StringPtr base, kj::StringPtr relative, kj::StringPtr expected,
+                           Url::Options options = {}) {
+  auto parsed = Url::parse(base, Url::REMOTE_HREF, options).parseRelative(relative);
   KJ_EXPECT(kj::str(parsed) == expected, parsed, expected);
+  auto clone = parsed.clone();
+  KJ_EXPECT(kj::str(clone) == expected, clone, expected);
 }
 
 KJ_TEST("parse relative URL") {
   parseAndCheckRelative("https://capnproto.org/foo/bar?baz=qux#corge",
                         "#grault",
                         "https://capnproto.org/foo/bar?baz=qux#grault");
+  parseAndCheckRelative("https://capnproto.org/foo/bar?baz#corge",
+                        "#grault",
+                        "https://capnproto.org/foo/bar?baz#grault");
+  parseAndCheckRelative("https://capnproto.org/foo/bar?baz=#corge",
+                        "#grault",
+                        "https://capnproto.org/foo/bar?baz=#grault");
   parseAndCheckRelative("https://capnproto.org/foo/bar?baz=qux#corge",
                         "?grault",
                         "https://capnproto.org/foo/bar?grault");
+  parseAndCheckRelative("https://capnproto.org/foo/bar?baz=qux#corge",
+                        "?grault=",
+                        "https://capnproto.org/foo/bar?grault=");
+  parseAndCheckRelative("https://capnproto.org/foo/bar?baz=qux#corge",
+                        "?grault+garply=waldo",
+                        "https://capnproto.org/foo/bar?grault+garply=waldo");
   parseAndCheckRelative("https://capnproto.org/foo/bar?baz=qux#corge",
                         "grault",
                         "https://capnproto.org/foo/grault");
@@ -357,7 +538,22 @@ KJ_TEST("parse relative URL") {
                         "http://capnproto.org/grault");
   parseAndCheckRelative("https://capnproto.org/foo/bar?baz=qux#corge",
                         "/http:/grault",
-                        "https://capnproto.org/http%3A/grault");
+                        "https://capnproto.org/http:/grault");
+  parseAndCheckRelative("https://capnproto.org/",
+                        "/foo/../bar",
+                        "https://capnproto.org/bar");
+}
+
+KJ_TEST("parse relative URL w/o decoding") {
+  // This case would throw an exception without NO_DECODE.
+  parseAndCheckRelative("https://capnproto.org/R%20%26%20S?%foo=%QQ",
+                        "%ANOTH%ERBAD%URL",
+                        "https://capnproto.org/%ANOTH%ERBAD%URL", NO_DECODE);
+}
+
+KJ_TEST("parse relative URL failure") {
+  auto base = Url::parse("https://example.com/");
+  KJ_EXPECT(base.tryParseRelative("https://[not a host]") == nullptr);
 }
 
 }  // namespace

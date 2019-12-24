@@ -29,6 +29,11 @@
 //
 // This test must be compiled as a separate program, since it alters the calling process by
 // enabling seccomp to disable the kernel features.
+//
+// At present this test only runs under Ekam builds. It *could* reasonably easily be added to the
+// autotools or cmake builds, but would require compiling a separate test binary, which is a bit
+// weird, and may lead to spurious error reports on systems that don't support seccomp for whatever
+// reason.
 
 #include <syscall.h>
 #include <unistd.h>
@@ -116,4 +121,13 @@ SetupSeccompForFilesystemTest setupSeccompForFilesystemTest;
 
 #endif
 #endif
+#endif
+
+#if __linux__ && !__x86_64__
+// HACK: We may be cross-compiling. Ekam's cross-compiling is currently hacky -- if a test is a
+//   test on the host platform then it needs to be a test on all other targets, too. So add a dummy
+//   test here.
+// TODO(cleanup): Make Ekam cross-compiling better.
+#include <kj/test.h>
+KJ_TEST("old kernel test -- not supported on this architecture") {}
 #endif

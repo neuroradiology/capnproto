@@ -21,13 +21,13 @@
 
 #include "schema.capnp.h"
 
-#ifdef CAPNP_CAPABILITY_H_
+#ifdef CAPNP_CAPABILITY_H_INCLUDED
 #error "schema.capnp should not depend on capability.h, because it contains no interfaces."
 #endif
 
 #include <capnp/test.capnp.h>
 
-#ifndef CAPNP_CAPABILITY_H_
+#ifndef CAPNP_CAPABILITY_H_INCLUDED
 #error "test.capnp did not include capability.h."
 #endif
 
@@ -1029,6 +1029,268 @@ TEST(Capability, TransferCap) {
   }, [](kj::Exception&&) {
     // success
   }).wait(waitScope);
+}
+
+KJ_TEST("Promise<RemotePromise<T>> automatically reduces to RemotePromise<T>") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  int callCount = 0;
+  test::TestInterface::Client client(kj::heap<TestInterfaceImpl>(callCount));
+
+  RemotePromise<test::TestInterface::FooResults> promise = kj::evalLater([&]() {
+    auto request = client.fooRequest();
+    request.setI(123);
+    request.setJ(true);
+    return request.send();
+  });
+
+  EXPECT_EQ(0, callCount);
+  auto response = promise.wait(waitScope);
+  EXPECT_EQ("foo", response.getX());
+  EXPECT_EQ(1, callCount);
+}
+
+KJ_TEST("Promise<RemotePromise<T>> automatically reduces to RemotePromise<T> with pipelining") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  int callCount = 0;
+  int chainedCallCount = 0;
+  test::TestPipeline::Client client(kj::heap<TestPipelineImpl>(callCount));
+
+  auto promise = kj::evalLater([&]() {
+    auto request = client.getCapRequest();
+    request.setN(234);
+    request.setInCap(test::TestInterface::Client(kj::heap<TestInterfaceImpl>(chainedCallCount)));
+    return request.send();
+  });
+
+  auto pipelineRequest = promise.getOutBox().getCap().fooRequest();
+  pipelineRequest.setI(321);
+  auto pipelinePromise = pipelineRequest.send();
+
+  EXPECT_EQ(0, callCount);
+  EXPECT_EQ(0, chainedCallCount);
+
+  auto response = pipelinePromise.wait(waitScope);
+  EXPECT_EQ("bar", response.getX());
+
+  EXPECT_EQ(2, callCount);
+  EXPECT_EQ(1, chainedCallCount);
+}
+
+KJ_TEST("clone() with caps") {
+  int dummy = 0;
+  MallocMessageBuilder builder(2048);
+  auto root = builder.getRoot<AnyPointer>().initAs<List<test::TestInterface>>(3);
+  root.set(0, kj::heap<TestInterfaceImpl>(dummy));
+  root.set(1, kj::heap<TestInterfaceImpl>(dummy));
+  root.set(2, kj::heap<TestInterfaceImpl>(dummy));
+
+  auto copyPtr = clone(root.asReader());
+  auto& copy = *copyPtr;
+
+  KJ_ASSERT(copy.size() == 3);
+  KJ_EXPECT(ClientHook::from(copy[0]).get() == ClientHook::from(root[0]).get());
+  KJ_EXPECT(ClientHook::from(copy[1]).get() == ClientHook::from(root[1]).get());
+  KJ_EXPECT(ClientHook::from(copy[2]).get() == ClientHook::from(root[2]).get());
+
+  KJ_EXPECT(ClientHook::from(copy[0]).get() != ClientHook::from(root[1]).get());
+  KJ_EXPECT(ClientHook::from(copy[1]).get() != ClientHook::from(root[2]).get());
+  KJ_EXPECT(ClientHook::from(copy[2]).get() != ClientHook::from(root[0]).get());
+}
+
+KJ_TEST("Streaming calls block subsequent calls") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  auto ownServer = kj::heap<TestStreamingImpl>();
+  auto& server = *ownServer;
+  test::TestStreaming::Client cap = kj::mv(ownServer);
+
+  kj::Promise<void> promise1 = nullptr, promise2 = nullptr, promise3 = nullptr;
+
+  {
+    auto req = cap.doStreamIRequest();
+    req.setI(123);
+    promise1 = req.send();
+  }
+
+  {
+    auto req = cap.doStreamJRequest();
+    req.setJ(321);
+    promise2 = req.send();
+  }
+
+  {
+    auto req = cap.doStreamIRequest();
+    req.setI(456);
+    promise3 = req.send();
+  }
+
+  auto promise4 = cap.finishStreamRequest().send();
+
+  KJ_EXPECT(server.iSum == 0);
+  KJ_EXPECT(server.jSum == 0);
+
+  KJ_EXPECT(!promise1.poll(waitScope));
+  KJ_EXPECT(!promise2.poll(waitScope));
+  KJ_EXPECT(!promise3.poll(waitScope));
+  KJ_EXPECT(!promise4.poll(waitScope));
+
+  KJ_EXPECT(server.iSum == 123);
+  KJ_EXPECT(server.jSum == 0);
+
+  KJ_ASSERT_NONNULL(server.fulfiller)->fulfill();
+
+  KJ_EXPECT(promise1.poll(waitScope));
+  KJ_EXPECT(!promise2.poll(waitScope));
+  KJ_EXPECT(!promise3.poll(waitScope));
+  KJ_EXPECT(!promise4.poll(waitScope));
+
+  KJ_EXPECT(server.iSum == 123);
+  KJ_EXPECT(server.jSum == 321);
+
+  KJ_ASSERT_NONNULL(server.fulfiller)->fulfill();
+
+  KJ_EXPECT(promise1.poll(waitScope));
+  KJ_EXPECT(promise2.poll(waitScope));
+  KJ_EXPECT(!promise3.poll(waitScope));
+  KJ_EXPECT(!promise4.poll(waitScope));
+
+  KJ_EXPECT(server.iSum == 579);
+  KJ_EXPECT(server.jSum == 321);
+
+  KJ_ASSERT_NONNULL(server.fulfiller)->fulfill();
+
+  KJ_EXPECT(promise1.poll(waitScope));
+  KJ_EXPECT(promise2.poll(waitScope));
+  KJ_EXPECT(promise3.poll(waitScope));
+  KJ_EXPECT(promise4.poll(waitScope));
+
+  auto result = promise4.wait(waitScope);
+  KJ_EXPECT(result.getTotalI() == 579);
+  KJ_EXPECT(result.getTotalJ() == 321);
+}
+
+KJ_TEST("Streaming calls can be canceled") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  auto ownServer = kj::heap<TestStreamingImpl>();
+  auto& server = *ownServer;
+  test::TestStreaming::Client cap = kj::mv(ownServer);
+
+  kj::Promise<void> promise1 = nullptr, promise2 = nullptr, promise3 = nullptr;
+
+  {
+    auto req = cap.doStreamIRequest();
+    req.setI(123);
+    promise1 = req.send();
+  }
+
+  {
+    auto req = cap.doStreamJRequest();
+    req.setJ(321);
+    promise2 = req.send();
+  }
+
+  {
+    auto req = cap.doStreamIRequest();
+    req.setI(456);
+    promise3 = req.send();
+  }
+
+  auto promise4 = cap.finishStreamRequest().send();
+
+  // Cancel the streaming calls.
+  promise1 = nullptr;
+  promise2 = nullptr;
+  promise3 = nullptr;
+
+  KJ_EXPECT(server.iSum == 0);
+  KJ_EXPECT(server.jSum == 0);
+
+  KJ_EXPECT(!promise4.poll(waitScope));
+
+  KJ_EXPECT(server.iSum == 123);
+  KJ_EXPECT(server.jSum == 0);
+
+  KJ_ASSERT_NONNULL(server.fulfiller)->fulfill();
+
+  KJ_EXPECT(!promise4.poll(waitScope));
+
+  // The call to doStreamJ() opted into cancellation so the next call to doStreamI() happens
+  // immediately.
+  KJ_EXPECT(server.iSum == 579);
+  KJ_EXPECT(server.jSum == 321);
+
+  KJ_ASSERT_NONNULL(server.fulfiller)->fulfill();
+
+  KJ_EXPECT(promise4.poll(waitScope));
+
+  auto result = promise4.wait(waitScope);
+  KJ_EXPECT(result.getTotalI() == 579);
+  KJ_EXPECT(result.getTotalJ() == 321);
+}
+
+KJ_TEST("Streaming call throwing cascades to following calls") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  auto ownServer = kj::heap<TestStreamingImpl>();
+  auto& server = *ownServer;
+  test::TestStreaming::Client cap = kj::mv(ownServer);
+
+  server.jShouldThrow = true;
+
+  kj::Promise<void> promise1 = nullptr, promise2 = nullptr, promise3 = nullptr;
+
+  {
+    auto req = cap.doStreamIRequest();
+    req.setI(123);
+    promise1 = req.send();
+  }
+
+  {
+    auto req = cap.doStreamJRequest();
+    req.setJ(321);
+    promise2 = req.send();
+  }
+
+  {
+    auto req = cap.doStreamIRequest();
+    req.setI(456);
+    promise3 = req.send();
+  }
+
+  auto promise4 = cap.finishStreamRequest().send();
+
+  KJ_EXPECT(server.iSum == 0);
+  KJ_EXPECT(server.jSum == 0);
+
+  KJ_EXPECT(!promise1.poll(waitScope));
+  KJ_EXPECT(!promise2.poll(waitScope));
+  KJ_EXPECT(!promise3.poll(waitScope));
+  KJ_EXPECT(!promise4.poll(waitScope));
+
+  KJ_EXPECT(server.iSum == 123);
+  KJ_EXPECT(server.jSum == 0);
+
+  KJ_ASSERT_NONNULL(server.fulfiller)->fulfill();
+
+  KJ_EXPECT(promise1.poll(waitScope));
+  KJ_EXPECT(promise2.poll(waitScope));
+  KJ_EXPECT(promise3.poll(waitScope));
+  KJ_EXPECT(promise4.poll(waitScope));
+
+  KJ_EXPECT(server.iSum == 123);
+  KJ_EXPECT(server.jSum == 321);
+
+  KJ_EXPECT_THROW_MESSAGE("throw requested", promise2.wait(waitScope));
+  KJ_EXPECT_THROW_MESSAGE("throw requested", promise3.wait(waitScope));
+  KJ_EXPECT_THROW_MESSAGE("throw requested", promise4.wait(waitScope));
 }
 
 }  // namespace

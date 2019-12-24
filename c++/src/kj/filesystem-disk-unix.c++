@@ -19,6 +19,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#if !_WIN32
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "filesystem.h"
 #include "debug.h"
 #include <sys/types.h>
@@ -30,13 +36,13 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <dirent.h>
-#include <syscall.h>
 #include <stdlib.h>
 #include "vector.h"
 #include "miniposix.h"
 #include <algorithm>
 
 #if __linux__
+#include <syscall.h>
 #include <linux/fs.h>
 #include <sys/sendfile.h>
 #endif
@@ -59,6 +65,16 @@ namespace {
 #define MAYBE_O_DIRECTORY O_DIRECTORY
 #else
 #define MAYBE_O_DIRECTORY 0
+#endif
+
+#if __APPLE__
+// Mac OSX defines SEEK_HOLE, but it doesn't work. ("Inappropriate ioctl for device", it says.)
+#undef SEEK_HOLE
+#endif
+
+#if __BIONIC__
+// No no DTTOIF function
+#undef DT_UNKNOWN
 #endif
 
 static void setCloexec(int fd) KJ_UNUSED;
@@ -113,12 +129,22 @@ static FsNode::Type modeToType(mode_t mode) {
 }
 
 static FsNode::Metadata statToMetadata(struct stat& stats) {
+  // Probably st_ino and st_dev are usually under 32 bits, so mix by rotating st_dev left 32 bits
+  // and XOR.
+  uint64_t d = stats.st_dev;
+  uint64_t hash = ((d << 32) | (d >> 32)) ^ stats.st_ino;
+
   return FsNode::Metadata {
     modeToType(stats.st_mode),
     implicitCast<uint64_t>(stats.st_size),
     implicitCast<uint64_t>(stats.st_blocks * 512u),
+#if __APPLE__
+    toKjDate(stats.st_mtimespec),
+#else
     toKjDate(stats.st_mtim),
-    implicitCast<uint>(stats.st_nlink)
+#endif
+    implicitCast<uint>(stats.st_nlink),
+    hash
   };
 }
 
@@ -201,7 +227,12 @@ struct MmapRange {
 };
 
 static MmapRange getMmapRange(uint64_t offset, uint64_t size) {
-  // Rounds the given byte range up to page boundaries.
+  // Comes up with an offset and size to pass to mmap(), given an offset and size requested by
+  // the caller, and considering the fact that mappings must start at a page boundary.
+  //
+  // The offset is rounded down to the nearest page boundary, and the size is increased to
+  // compensate. Note that the endpoint of the mapping is *not* rounded up to a page boundary, as
+  // mmap() does not actually require this, and it causes trouble on some systems (notably Cygwin).
 
 #ifndef _SC_PAGESIZE
 #define _SC_PAGESIZE _SC_PAGE_SIZE
@@ -211,10 +242,7 @@ static MmapRange getMmapRange(uint64_t offset, uint64_t size) {
 
   uint64_t realOffset = offset & ~pageMask;
 
-  uint64_t end = offset + size;
-  uint64_t realEnd = (end + pageMask) & ~pageMask;
-
-  return { realOffset, realEnd - realOffset };
+  return { realOffset, offset + size - realOffset };
 }
 
 class MmapDisposer: public ArrayDisposer {
@@ -223,12 +251,7 @@ protected:
                    size_t capacity, void (*destroyElement)(void*)) const {
     auto range = getMmapRange(reinterpret_cast<uintptr_t>(firstElement),
                               elementSize * elementCount);
-
-#if _WIN32
-    KJ_ASSERT(UnmapViewOfFile(reinterpret_cast<byte*>(range.offset))) { break; }
-#else
     KJ_SYSCALL(munmap(reinterpret_cast<byte*>(range.offset), range.size)) { break; }
-#endif
   }
 };
 
@@ -249,7 +272,7 @@ public:
 
   // OsHandle ------------------------------------------------------------------
 
-  AutoCloseFd clone() {
+  AutoCloseFd clone() const {
     int fd2;
 #ifdef F_DUPFD_CLOEXEC
     KJ_SYSCALL_HANDLE_ERRORS(fd2 = fcntl(fd, F_DUPFD_CLOEXEC, 3)) {
@@ -271,24 +294,42 @@ public:
     return result;
   }
 
-  int getFd() {
+  int getFd() const {
     return fd.get();
   }
 
   // FsNode --------------------------------------------------------------------
 
-  FsNode::Metadata stat() {
+  FsNode::Metadata stat() const {
     struct stat stats;
     KJ_SYSCALL(::fstat(fd, &stats));
     return statToMetadata(stats);
   }
 
-  void sync() { KJ_SYSCALL(fsync(fd)); }
-  void datasync() { KJ_SYSCALL(fdatasync(fd)); }
+  void sync() const {
+#if __APPLE__
+    // For whatever reason, fsync() on OSX only flushes kernel buffers. It does not flush hardware
+    // disk buffers. This makes it not very useful. But OSX documents fcntl F_FULLFSYNC which does
+    // the right thing. Why they don't just make fsync() do the right thing, I do not know.
+    KJ_SYSCALL(fcntl(fd, F_FULLFSYNC));
+#else
+    KJ_SYSCALL(fsync(fd));
+#endif
+  }
+
+  void datasync() const {
+    // The presence of the _POSIX_SYNCHRONIZED_IO define is supposed to tell us that fdatasync()
+    // exists. But Apple defines this yet doesn't offer fdatasync(). Thanks, Apple.
+#if _POSIX_SYNCHRONIZED_IO && !__APPLE__
+    KJ_SYSCALL(fdatasync(fd));
+#else
+    this->sync();
+#endif
+  }
 
   // ReadableFile --------------------------------------------------------------
 
-  size_t read(uint64_t offset, ArrayPtr<byte> buffer) {
+  size_t read(uint64_t offset, ArrayPtr<byte> buffer) const {
     // pread() probably never returns short reads unless it hits EOF. Unfortunately, though, per
     // spec we are not allowed to assume this.
 
@@ -304,7 +345,8 @@ public:
     return total;
   }
 
-  Array<const byte> mmap(uint64_t offset, uint64_t size) {
+  Array<const byte> mmap(uint64_t offset, uint64_t size) const {
+    if (size == 0) return nullptr;  // zero-length mmap() returns EINVAL, so avoid it
     auto range = getMmapRange(offset, size);
     const void* mapping = ::mmap(NULL, range.size, PROT_READ, MAP_SHARED, fd, range.offset);
     if (mapping == MAP_FAILED) {
@@ -314,7 +356,8 @@ public:
                              size, mmapDisposer);
   }
 
-  Array<byte> mmapPrivate(uint64_t offset, uint64_t size) {
+  Array<byte> mmapPrivate(uint64_t offset, uint64_t size) const {
+    if (size == 0) return nullptr;  // zero-length mmap() returns EINVAL, so avoid it
     auto range = getMmapRange(offset, size);
     void* mapping = ::mmap(NULL, range.size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, range.offset);
     if (mapping == MAP_FAILED) {
@@ -326,7 +369,7 @@ public:
 
   // File ----------------------------------------------------------------------
 
-  void write(uint64_t offset, ArrayPtr<const byte> data) {
+  void write(uint64_t offset, ArrayPtr<const byte> data) const {
     // pwrite() probably never returns short writes unless there's no space left on disk.
     // Unfortunately, though, per spec we are not allowed to assume this.
 
@@ -339,7 +382,7 @@ public:
     }
   }
 
-  void zero(uint64_t offset, uint64_t size)  {
+  void zero(uint64_t offset, uint64_t size) const {
 #ifdef FALLOC_FL_PUNCH_HOLE
     KJ_SYSCALL_HANDLE_ERRORS(
         fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size)) {
@@ -353,26 +396,34 @@ public:
     }
 #endif
 
-    // Use a 4k buffer of zeros amplified by iov to write zeros with as few syscalls as possible.
-    byte buffer[4096];
-    memset(buffer, 0, sizeof(buffer));
+    static const byte ZEROS[4096] = { 0 };
 
-    size_t count = (size + sizeof(buffer) - 1) / sizeof(buffer);
+#if __APPLE__ || __CYGWIN__ || (defined(__ANDROID__) && __ANDROID_API__ < 24)
+    // Mac & Cygwin & Android API levels 23 and lower doesn't have pwritev().
+    while (size > sizeof(ZEROS)) {
+      write(offset, ZEROS);
+      size -= sizeof(ZEROS);
+      offset += sizeof(ZEROS);
+    }
+    write(offset, kj::arrayPtr(ZEROS, size));
+#else
+    // Use a 4k buffer of zeros amplified by iov to write zeros with as few syscalls as possible.
+    size_t count = (size + sizeof(ZEROS) - 1) / sizeof(ZEROS);
     const size_t iovmax = miniposix::iovMax(count);
     KJ_STACK_ARRAY(struct iovec, iov, kj::min(iovmax, count), 16, 256);
 
     for (auto& item: iov) {
-      item.iov_base = buffer;
-      item.iov_len = sizeof(buffer);
+      item.iov_base = const_cast<byte*>(ZEROS);
+      item.iov_len = sizeof(ZEROS);
     }
 
     while (size > 0) {
       size_t iovCount;
-      if (size >= iov.size() * sizeof(buffer)) {
+      if (size >= iov.size() * sizeof(ZEROS)) {
         iovCount = iov.size();
       } else {
-        iovCount = size / sizeof(buffer);
-        size_t rem = size % sizeof(buffer);
+        iovCount = size / sizeof(ZEROS);
+        size_t rem = size % sizeof(ZEROS);
         if (rem > 0) {
           iov[iovCount++].iov_len = rem;
         }
@@ -385,37 +436,52 @@ public:
       offset += n;
       size -= n;
     }
+#endif
   }
 
-  void truncate(uint64_t size)  {
+  void truncate(uint64_t size) const {
     KJ_SYSCALL(ftruncate(fd, size));
   }
 
-  class WritableFileMappingImpl: public WritableFileMapping {
+  class WritableFileMappingImpl final: public WritableFileMapping {
   public:
     WritableFileMappingImpl(Array<byte> bytes): bytes(kj::mv(bytes)) {}
 
-    ArrayPtr<byte> get() override {
-      return bytes;
+    ArrayPtr<byte> get() const override {
+      // const_cast OK because WritableFileMapping does indeed provide a writable view despite
+      // being const itself.
+      return arrayPtr(const_cast<byte*>(bytes.begin()), bytes.size());
     }
 
-    void changed(ArrayPtr<byte> slice) override {
+    void changed(ArrayPtr<byte> slice) const override {
       KJ_REQUIRE(slice.begin() >= bytes.begin() && slice.end() <= bytes.end(),
                  "byte range is not part of this mapping");
-      KJ_SYSCALL(msync(slice.begin(), slice.size(), MS_ASYNC));
+      if (slice.size() == 0) return;
+
+      // msync() requires page-alignment, apparently, so use getMmapRange() to accomplish that.
+      auto range = getMmapRange(reinterpret_cast<uintptr_t>(slice.begin()), slice.size());
+      KJ_SYSCALL(msync(reinterpret_cast<void*>(range.offset), range.size, MS_ASYNC));
     }
 
-    void sync(ArrayPtr<byte> slice) override {
+    void sync(ArrayPtr<byte> slice) const override {
       KJ_REQUIRE(slice.begin() >= bytes.begin() && slice.end() <= bytes.end(),
                  "byte range is not part of this mapping");
-      KJ_SYSCALL(msync(slice.begin(), slice.size(), MS_SYNC));
+      if (slice.size() == 0) return;
+
+      // msync() requires page-alignment, apparently, so use getMmapRange() to accomplish that.
+      auto range = getMmapRange(reinterpret_cast<uintptr_t>(slice.begin()), slice.size());
+      KJ_SYSCALL(msync(reinterpret_cast<void*>(range.offset), range.size, MS_SYNC));
     }
 
   private:
     Array<byte> bytes;
   };
 
-  Own<WritableFileMapping> mmapWritable(uint64_t offset, uint64_t size)  {
+  Own<const WritableFileMapping> mmapWritable(uint64_t offset, uint64_t size) const {
+    if (size == 0) {
+      // zero-length mmap() returns EINVAL, so avoid it
+      return heap<WritableFileMappingImpl>(nullptr);
+    }
     auto range = getMmapRange(offset, size);
     void* mapping = ::mmap(NULL, range.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, range.offset);
     if (mapping == MAP_FAILED) {
@@ -426,7 +492,7 @@ public:
     return heap<WritableFileMappingImpl>(kj::mv(array));
   }
 
-  size_t copyChunk(uint64_t offset, int fromFd, uint64_t fromOffset, uint64_t size) {
+  size_t copyChunk(uint64_t offset, int fromFd, uint64_t fromOffset, uint64_t size) const {
     // Copies a range of bytes from `fromFd` to this file in the most efficient way possible for
     // the OS. Only returns less than `size` if EOF. Does not account for holes.
 
@@ -444,6 +510,7 @@ public:
           default:
             KJ_FAIL_SYSCALL("sendfile", error) { return fromPos - fromOffset; }
         }
+        if (n == 0) break;
       }
       return fromPos - fromOffset;
     }
@@ -465,7 +532,8 @@ public:
     return total;
   }
 
-  kj::Maybe<size_t> copy(uint64_t offset, ReadableFile& from, uint64_t fromOffset, uint64_t size) {
+  kj::Maybe<size_t> copy(uint64_t offset, const ReadableFile& from,
+                         uint64_t fromOffset, uint64_t size) const {
     KJ_IF_MAYBE(otherFd, from.getFd()) {
 #ifdef FICLONE
       if (offset == 0 && fromOffset == 0 && size == kj::maxValue && stat().size == 0) {
@@ -584,7 +652,7 @@ public:
   // ReadableDirectory ---------------------------------------------------------
 
   template <typename Func>
-  auto list(bool needTypes, Func&& func)
+  auto list(bool needTypes, Func&& func) const
       -> Array<Decay<decltype(func(instance<StringPtr>(), instance<FsNode::Type>()))>> {
     // Seek to start of directory.
     KJ_SYSCALL(lseek(fd, 0, SEEK_SET));
@@ -641,17 +709,17 @@ public:
     return result;
   }
 
-  Array<String> listNames() {
+  Array<String> listNames() const {
     return list(false, [](StringPtr name, FsNode::Type type) { return heapString(name); });
   }
 
-  Array<ReadableDirectory::Entry> listEntries() {
+  Array<ReadableDirectory::Entry> listEntries() const {
     return list(true, [](StringPtr name, FsNode::Type type) {
       return ReadableDirectory::Entry { type, heapString(name), };
     });
   }
 
-  bool exists(PathPtr path) {
+  bool exists(PathPtr path) const {
     KJ_SYSCALL_HANDLE_ERRORS(faccessat(fd, path.toString().cStr(), F_OK, 0)) {
       case ENOENT:
       case ENOTDIR:
@@ -662,7 +730,7 @@ public:
     return true;
   }
 
-  Maybe<FsNode::Metadata> tryLstat(PathPtr path) {
+  Maybe<FsNode::Metadata> tryLstat(PathPtr path) const {
     struct stat stats;
     KJ_SYSCALL_HANDLE_ERRORS(fstatat(fd, path.toString().cStr(), &stats, AT_SYMLINK_NOFOLLOW)) {
       case ENOENT:
@@ -674,7 +742,7 @@ public:
     return statToMetadata(stats);
   }
 
-  Maybe<Own<ReadableFile>> tryOpenFile(PathPtr path) {
+  Maybe<Own<const ReadableFile>> tryOpenFile(PathPtr path) const {
     int newFd;
     KJ_SYSCALL_HANDLE_ERRORS(newFd = openat(
         fd, path.toString().cStr(), O_RDONLY | MAYBE_O_CLOEXEC)) {
@@ -693,7 +761,7 @@ public:
     return newDiskReadableFile(kj::mv(result));
   }
 
-  Maybe<AutoCloseFd> tryOpenSubdirInternal(PathPtr path) {
+  Maybe<AutoCloseFd> tryOpenSubdirInternal(PathPtr path) const {
     int newFd;
     KJ_SYSCALL_HANDLE_ERRORS(newFd = openat(
         fd, path.toString().cStr(), O_RDONLY | MAYBE_O_CLOEXEC | MAYBE_O_DIRECTORY)) {
@@ -719,11 +787,11 @@ public:
     return kj::mv(result);
   }
 
-  Maybe<Own<ReadableDirectory>> tryOpenSubdir(PathPtr path) {
+  Maybe<Own<const ReadableDirectory>> tryOpenSubdir(PathPtr path) const {
     return tryOpenSubdirInternal(path).map(newDiskReadableDirectory);
   }
 
-  Maybe<String> tryReadlink(PathPtr path) {
+  Maybe<String> tryReadlink(PathPtr path) const {
     size_t trySize = 256;
     for (;;) {
       KJ_STACK_ARRAY(char, buf, trySize, 256, 4096);
@@ -754,7 +822,7 @@ public:
 
   // Directory -----------------------------------------------------------------
 
-  bool tryMkdir(PathPtr path, WriteMode mode, bool noThrow) {
+  bool tryMkdir(PathPtr path, WriteMode mode, bool noThrow) const {
     // Internal function to make a directory.
 
     auto filename = path.toString();
@@ -804,7 +872,7 @@ public:
   }
 
   kj::Maybe<String> createNamedTemporary(
-      PathPtr finalName, WriteMode mode, Function<int(StringPtr)> tryCreate) {
+      PathPtr finalName, WriteMode mode, Function<int(StringPtr)> tryCreate) const {
     // Create a temporary file which will eventually replace `finalName`.
     //
     // Calls `tryCreate` to actually create the temporary, passing in the desired path. tryCreate()
@@ -850,7 +918,7 @@ public:
     return kj::mv(path);
   }
 
-  bool tryReplaceNode(PathPtr path, WriteMode mode, Function<int(StringPtr)> tryCreate) {
+  bool tryReplaceNode(PathPtr path, WriteMode mode, Function<int(StringPtr)> tryCreate) const {
     // Replaces the given path with an object created by calling tryCreate().
     //
     // tryCreate() must behave like a syscall which creates the node at the path passed to it,
@@ -884,6 +952,7 @@ public:
             // Retry, but make sure we don't try to create the parent again.
             return tryReplaceNode(path, mode - WriteMode::CREATE_PARENT, kj::mv(tryCreate));
           }
+          // fallthrough
         default:
           KJ_FAIL_SYSCALL("create(path)", error, path) { return false; }
       } else {
@@ -914,7 +983,7 @@ public:
     }
   }
 
-  Maybe<AutoCloseFd> tryOpenFileInternal(PathPtr path, WriteMode mode, bool append) {
+  Maybe<AutoCloseFd> tryOpenFileInternal(PathPtr path, WriteMode mode, bool append) const {
     uint flags = O_RDWR | MAYBE_O_CLOEXEC;
     mode_t acl = 0666;
     if (has(mode, WriteMode::CREATE)) {
@@ -992,7 +1061,7 @@ public:
   }
 
   bool tryCommitReplacement(StringPtr toPath, int fromDirFd, StringPtr fromPath, WriteMode mode,
-                            int* errorReason = nullptr) {
+                            int* errorReason = nullptr) const {
     if (has(mode, WriteMode::CREATE) && has(mode, WriteMode::MODIFY)) {
       // Always clobber. Try it.
       KJ_SYSCALL_HANDLE_ERRORS(renameat(fromDirFd, fromPath.cStr(), fd.get(), toPath.cStr())) {
@@ -1016,7 +1085,7 @@ public:
       }
     }
 
-#ifdef RENAME_EXCHANGE
+#if __linux__ && defined(RENAME_EXCHANGE)
     // Try to use Linux's renameat2() to atomically check preconditions and apply.
 
     if (has(mode, WriteMode::MODIFY)) {
@@ -1096,7 +1165,15 @@ public:
         if (S_ISDIR(stats.st_mode)) {
           return mkdirat(fd, candidatePath.cStr(), 0700);
         } else {
+#if __APPLE__
+          // No mknodat() on OSX, gotta open() a file, ugh.
+          int newFd = openat(fd, candidatePath.cStr(),
+                             O_RDWR | O_CREAT | O_EXCL | MAYBE_O_CLOEXEC, 0700);
+          if (newFd >= 0) close(newFd);
+          return newFd;
+#else
           return mknodat(fd, candidatePath.cStr(), S_IFREG | 0600, dev_t());
+#endif
         }
       })) {
         away = kj::mv(*awayPath);
@@ -1172,9 +1249,9 @@ public:
   }
 
   template <typename T>
-  class ReplacerImpl: public Directory::Replacer<T> {
+  class ReplacerImpl final: public Directory::Replacer<T> {
   public:
-    ReplacerImpl(Own<T>&& object, DiskHandle& handle,
+    ReplacerImpl(Own<const T>&& object, const DiskHandle& handle,
                  String&& tempPath, String&& path, WriteMode mode)
         : Directory::Replacer<T>(mode),
           object(kj::mv(object)), handle(handle),
@@ -1186,7 +1263,7 @@ public:
       }
     }
 
-    T& get() override {
+    const T& get() override {
       return *object;
     }
 
@@ -1197,34 +1274,34 @@ public:
     }
 
   private:
-    Own<T> object;
-    DiskHandle& handle;
+    Own<const T> object;
+    const DiskHandle& handle;
     String tempPath;
     String path;
     bool committed = false;  // true if *successfully* committed (in which case tempPath is gone)
   };
 
   template <typename T>
-  class BrokenReplacer: public Directory::Replacer<T> {
+  class BrokenReplacer final: public Directory::Replacer<T> {
     // For recovery path when exceptions are disabled.
 
   public:
-    BrokenReplacer(Own<T> inner)
+    BrokenReplacer(Own<const T> inner)
         : Directory::Replacer<T>(WriteMode::CREATE | WriteMode::MODIFY),
           inner(kj::mv(inner)) {}
 
-    T& get() override { return *inner; }
+    const T& get() override { return *inner; }
     bool tryCommit() override { return false; }
 
   private:
-    Own<T> inner;
+    Own<const T> inner;
   };
 
-  Maybe<Own<File>> tryOpenFile(PathPtr path, WriteMode mode) {
+  Maybe<Own<const File>> tryOpenFile(PathPtr path, WriteMode mode) const {
     return tryOpenFileInternal(path, mode, false).map(newDiskFile);
   }
 
-  Own<Directory::Replacer<File>> replaceFile(PathPtr path, WriteMode mode) {
+  Own<Directory::Replacer<File>> replaceFile(PathPtr path, WriteMode mode) const {
     mode_t acl = 0666;
     if (has(mode, WriteMode::EXECUTABLE)) {
       acl = 0777;
@@ -1251,16 +1328,17 @@ public:
     }
   }
 
-  Own<File> createTemporary() {
+  Own<const File> createTemporary() const {
     int newFd_;
 
-#ifdef O_TMPFILE
+#if __linux__ && defined(O_TMPFILE)
     // Use syscall() to work around glibc bug with O_TMPFILE:
     //     https://sourceware.org/bugzilla/show_bug.cgi?id=17523
     KJ_SYSCALL_HANDLE_ERRORS(newFd_ = syscall(
         SYS_openat, fd.get(), ".", O_RDWR | O_TMPFILE, 0700)) {
       case EOPNOTSUPP:
       case EINVAL:
+      case EISDIR:
         // Maybe not supported by this kernel / filesystem. Fall back to below.
         break;
       default:
@@ -1292,11 +1370,11 @@ public:
     }
   }
 
-  Maybe<Own<AppendableFile>> tryAppendFile(PathPtr path, WriteMode mode) {
+  Maybe<Own<AppendableFile>> tryAppendFile(PathPtr path, WriteMode mode) const {
     return tryOpenFileInternal(path, mode, true).map(newDiskAppendableFile);
   }
 
-  Maybe<Own<Directory>> tryOpenSubdir(PathPtr path, WriteMode mode) {
+  Maybe<Own<const Directory>> tryOpenSubdir(PathPtr path, WriteMode mode) const {
     // Must create before open.
     if (has(mode, WriteMode::CREATE)) {
       if (!tryMkdir(path, mode, false)) return nullptr;
@@ -1305,7 +1383,7 @@ public:
     return tryOpenSubdirInternal(path).map(newDiskDirectory);
   }
 
-  Own<Directory::Replacer<Directory>> replaceSubdir(PathPtr path, WriteMode mode) {
+  Own<Directory::Replacer<Directory>> replaceSubdir(PathPtr path, WriteMode mode) const {
     mode_t acl = has(mode, WriteMode::PRIVATE) ? 0700 : 0777;
 
     KJ_IF_MAYBE(temp, createNamedTemporary(path, mode,
@@ -1332,15 +1410,15 @@ public:
     }
   }
 
-  bool trySymlink(PathPtr linkpath, StringPtr content, WriteMode mode) {
+  bool trySymlink(PathPtr linkpath, StringPtr content, WriteMode mode) const {
     return tryReplaceNode(linkpath, mode, [&](StringPtr candidatePath) {
       return symlinkat(content.cStr(), fd, candidatePath.cStr());
     });
   }
 
   bool tryTransfer(PathPtr toPath, WriteMode toMode,
-                   Directory& fromDirectory, PathPtr fromPath,
-                   TransferMode mode, Directory& self) {
+                   const Directory& fromDirectory, PathPtr fromPath,
+                   TransferMode mode, const Directory& self) const {
     KJ_REQUIRE(toPath.size() > 0, "can't replace self") { return false; }
 
     if (mode == TransferMode::LINK) {
@@ -1391,7 +1469,7 @@ public:
     return self.Directory::tryTransfer(toPath, toMode, fromDirectory, fromPath, mode);
   }
 
-  bool tryRemove(PathPtr path) {
+  bool tryRemove(PathPtr path) const {
     return rmrf(fd, path.toString());
   }
 
@@ -1399,16 +1477,16 @@ protected:
   AutoCloseFd fd;
 };
 
-#define FSNODE_METHODS(classname)                             \
-  Maybe<int> getFd() override { return DiskHandle::getFd(); } \
-                                                              \
-  Own<FsNode> cloneFsNode() override {                        \
-    return heap<classname>(DiskHandle::clone());              \
-  }                                                           \
-                                                              \
-  Metadata stat() override { return DiskHandle::stat(); }     \
-  void sync() override { DiskHandle::sync(); }                \
-  void datasync() override { DiskHandle::datasync(); }
+#define FSNODE_METHODS(classname)                                   \
+  Maybe<int> getFd() const override { return DiskHandle::getFd(); } \
+                                                                    \
+  Own<const FsNode> cloneFsNode() const override {                  \
+    return heap<classname>(DiskHandle::clone());                    \
+  }                                                                 \
+                                                                    \
+  Metadata stat() const override { return DiskHandle::stat(); }     \
+  void sync() const override { DiskHandle::sync(); }                \
+  void datasync() const override { DiskHandle::datasync(); }
 
 class DiskReadableFile final: public ReadableFile, public DiskHandle {
 public:
@@ -1416,13 +1494,13 @@ public:
 
   FSNODE_METHODS(DiskReadableFile);
 
-  size_t read(uint64_t offset, ArrayPtr<byte> buffer) override {
+  size_t read(uint64_t offset, ArrayPtr<byte> buffer) const override {
     return DiskHandle::read(offset, buffer);
   }
-  Array<const byte> mmap(uint64_t offset, uint64_t size) override {
+  Array<const byte> mmap(uint64_t offset, uint64_t size) const override {
     return DiskHandle::mmap(offset, size);
   }
-  Array<byte> mmapPrivate(uint64_t offset, uint64_t size) override {
+  Array<byte> mmapPrivate(uint64_t offset, uint64_t size) const override {
     return DiskHandle::mmapPrivate(offset, size);
   }
 };
@@ -1435,7 +1513,9 @@ public:
 
   FSNODE_METHODS(DiskAppendableFile);
 
-  void write(const void* buffer, size_t size) override { FdOutputStream::write(buffer, size); }
+  void write(const void* buffer, size_t size) override {
+    FdOutputStream::write(buffer, size);
+  }
   void write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
     FdOutputStream::write(pieces);
   }
@@ -1447,29 +1527,30 @@ public:
 
   FSNODE_METHODS(DiskFile);
 
-  size_t read(uint64_t offset, ArrayPtr<byte> buffer) override {
+  size_t read(uint64_t offset, ArrayPtr<byte> buffer) const override {
     return DiskHandle::read(offset, buffer);
   }
-  Array<const byte> mmap(uint64_t offset, uint64_t size) override {
+  Array<const byte> mmap(uint64_t offset, uint64_t size) const override {
     return DiskHandle::mmap(offset, size);
   }
-  Array<byte> mmapPrivate(uint64_t offset, uint64_t size) override {
+  Array<byte> mmapPrivate(uint64_t offset, uint64_t size) const override {
     return DiskHandle::mmapPrivate(offset, size);
   }
 
-  void write(uint64_t offset, ArrayPtr<const byte> data) override {
+  void write(uint64_t offset, ArrayPtr<const byte> data) const override {
     DiskHandle::write(offset, data);
   }
-  void zero(uint64_t offset, uint64_t size) override {
+  void zero(uint64_t offset, uint64_t size) const override {
     DiskHandle::zero(offset, size);
   }
-  void truncate(uint64_t size) override {
+  void truncate(uint64_t size) const override {
     DiskHandle::truncate(size);
   }
-  Own<WritableFileMapping> mmapWritable(uint64_t offset, uint64_t size) override {
+  Own<const WritableFileMapping> mmapWritable(uint64_t offset, uint64_t size) const override {
     return DiskHandle::mmapWritable(offset, size);
   }
-  size_t copy(uint64_t offset, ReadableFile& from, uint64_t fromOffset, uint64_t size) override {
+  size_t copy(uint64_t offset, const ReadableFile& from,
+              uint64_t fromOffset, uint64_t size) const override {
     KJ_IF_MAYBE(result, DiskHandle::copy(offset, from, fromOffset, size)) {
       return *result;
     } else {
@@ -1484,17 +1565,19 @@ public:
 
   FSNODE_METHODS(DiskReadableDirectory);
 
-  Array<String> listNames() override { return DiskHandle::listNames(); }
-  Array<Entry> listEntries() override { return DiskHandle::listEntries(); }
-  bool exists(PathPtr path) override { return DiskHandle::exists(path); }
-  Maybe<FsNode::Metadata> tryLstat(PathPtr path) override { return DiskHandle::tryLstat(path); }
-  Maybe<Own<ReadableFile>> tryOpenFile(PathPtr path) override {
+  Array<String> listNames() const override { return DiskHandle::listNames(); }
+  Array<Entry> listEntries() const override { return DiskHandle::listEntries(); }
+  bool exists(PathPtr path) const override { return DiskHandle::exists(path); }
+  Maybe<FsNode::Metadata> tryLstat(PathPtr path) const override {
+    return DiskHandle::tryLstat(path);
+  }
+  Maybe<Own<const ReadableFile>> tryOpenFile(PathPtr path) const override {
     return DiskHandle::tryOpenFile(path);
   }
-  Maybe<Own<ReadableDirectory>> tryOpenSubdir(PathPtr path) override {
+  Maybe<Own<const ReadableDirectory>> tryOpenSubdir(PathPtr path) const override {
     return DiskHandle::tryOpenSubdir(path);
   }
-  Maybe<String> tryReadlink(PathPtr path) override { return DiskHandle::tryReadlink(path); }
+  Maybe<String> tryReadlink(PathPtr path) const override { return DiskHandle::tryReadlink(path); }
 };
 
 class DiskDirectory final: public Directory, public DiskHandle {
@@ -1503,46 +1586,48 @@ public:
 
   FSNODE_METHODS(DiskDirectory);
 
-  Array<String> listNames() override { return DiskHandle::listNames(); }
-  Array<Entry> listEntries() override { return DiskHandle::listEntries(); }
-  bool exists(PathPtr path) override { return DiskHandle::exists(path); }
-  Maybe<FsNode::Metadata> tryLstat(PathPtr path) override { return DiskHandle::tryLstat(path); }
-  Maybe<Own<ReadableFile>> tryOpenFile(PathPtr path) override {
+  Array<String> listNames() const override { return DiskHandle::listNames(); }
+  Array<Entry> listEntries() const override { return DiskHandle::listEntries(); }
+  bool exists(PathPtr path) const override { return DiskHandle::exists(path); }
+  Maybe<FsNode::Metadata> tryLstat(PathPtr path) const override {
+    return DiskHandle::tryLstat(path);
+  }
+  Maybe<Own<const ReadableFile>> tryOpenFile(PathPtr path) const override {
     return DiskHandle::tryOpenFile(path);
   }
-  Maybe<Own<ReadableDirectory>> tryOpenSubdir(PathPtr path) override {
+  Maybe<Own<const ReadableDirectory>> tryOpenSubdir(PathPtr path) const override {
     return DiskHandle::tryOpenSubdir(path);
   }
-  Maybe<String> tryReadlink(PathPtr path) override { return DiskHandle::tryReadlink(path); }
+  Maybe<String> tryReadlink(PathPtr path) const override { return DiskHandle::tryReadlink(path); }
 
-  Maybe<Own<File>> tryOpenFile(PathPtr path, WriteMode mode) override {
+  Maybe<Own<const File>> tryOpenFile(PathPtr path, WriteMode mode) const override {
     return DiskHandle::tryOpenFile(path, mode);
   }
-  Own<Replacer<File>> replaceFile(PathPtr path, WriteMode mode) override {
+  Own<Replacer<File>> replaceFile(PathPtr path, WriteMode mode) const override {
     return DiskHandle::replaceFile(path, mode);
   }
-  Own<File> createTemporary() override {
+  Own<const File> createTemporary() const override {
     return DiskHandle::createTemporary();
   }
-  Maybe<Own<AppendableFile>> tryAppendFile(PathPtr path, WriteMode mode) override {
+  Maybe<Own<AppendableFile>> tryAppendFile(PathPtr path, WriteMode mode) const override {
     return DiskHandle::tryAppendFile(path, mode);
   }
-  Maybe<Own<Directory>> tryOpenSubdir(PathPtr path, WriteMode mode) override {
+  Maybe<Own<const Directory>> tryOpenSubdir(PathPtr path, WriteMode mode) const override {
     return DiskHandle::tryOpenSubdir(path, mode);
   }
-  Own<Replacer<Directory>> replaceSubdir(PathPtr path, WriteMode mode) override {
+  Own<Replacer<Directory>> replaceSubdir(PathPtr path, WriteMode mode) const override {
     return DiskHandle::replaceSubdir(path, mode);
   }
-  bool trySymlink(PathPtr linkpath, StringPtr content, WriteMode mode) override {
+  bool trySymlink(PathPtr linkpath, StringPtr content, WriteMode mode) const override {
     return DiskHandle::trySymlink(linkpath, content, mode);
   }
   bool tryTransfer(PathPtr toPath, WriteMode toMode,
-                   Directory& fromDirectory, PathPtr fromPath,
-                   TransferMode mode) override {
+                   const Directory& fromDirectory, PathPtr fromPath,
+                   TransferMode mode) const override {
     return DiskHandle::tryTransfer(toPath, toMode, fromDirectory, fromPath, mode, *this);
   }
   // tryTransferTo() not implemented because we have nothing special we can do.
-  bool tryRemove(PathPtr path) override {
+  bool tryRemove(PathPtr path) const override {
     return DiskHandle::tryRemove(path);
   }
 };
@@ -1554,15 +1639,15 @@ public:
         current(openDir(".")),
         currentPath(computeCurrentPath()) {}
 
-  Directory& getRoot() override {
+  const Directory& getRoot() const override {
     return root;
   }
 
-  Directory& getCurrent() override {
+  const Directory& getCurrent() const override {
     return current;
   }
 
-  PathPtr getCurrentPath() override {
+  PathPtr getCurrentPath() const override {
     return currentPath;
   }
 
@@ -1655,3 +1740,5 @@ Own<Filesystem> newDiskFilesystem() {
 }
 
 } // namespace kj
+
+#endif  // !_WIN32

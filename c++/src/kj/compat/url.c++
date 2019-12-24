@@ -31,14 +31,49 @@ namespace {
 
 constexpr auto ALPHAS = parse::charRange('a', 'z').orRange('A', 'Z');
 constexpr auto DIGITS = parse::charRange('0', '9');
+
 constexpr auto END_AUTHORITY = parse::anyOfChars("/?#");
-constexpr auto END_PATH_PART = parse::anyOfChars("/?#");
-constexpr auto END_QUERY_PART = parse::anyOfChars("&#");
+
+// Authority, path, and query components can typically be terminated by the start of a fragment.
+// However, fragments are disallowed in HTTP_REQUEST and HTTP_PROXY_REQUEST contexts. As a quirk, we
+// allow the fragment start character ('#') to live unescaped in path and query components. We do
+// not currently allow it in the authority component, because our parser would reject it as a host
+// character anyway.
+
+const parse::CharGroup_& getEndPathPart(Url::Context context) {
+  static constexpr auto END_PATH_PART_HREF = parse::anyOfChars("/?#");
+  static constexpr auto END_PATH_PART_REQUEST = parse::anyOfChars("/?");
+
+  switch (context) {
+    case Url::REMOTE_HREF:        return END_PATH_PART_HREF;
+    case Url::HTTP_PROXY_REQUEST: return END_PATH_PART_REQUEST;
+    case Url::HTTP_REQUEST:       return END_PATH_PART_REQUEST;
+  }
+
+  KJ_UNREACHABLE;
+}
+
+const parse::CharGroup_& getEndQueryPart(Url::Context context) {
+  static constexpr auto END_QUERY_PART_HREF = parse::anyOfChars("&#");
+  static constexpr auto END_QUERY_PART_REQUEST = parse::anyOfChars("&");
+
+  switch (context) {
+    case Url::REMOTE_HREF:        return END_QUERY_PART_HREF;
+    case Url::HTTP_PROXY_REQUEST: return END_QUERY_PART_REQUEST;
+    case Url::HTTP_REQUEST:       return END_QUERY_PART_REQUEST;
+  }
+
+  KJ_UNREACHABLE;
+}
 
 constexpr auto SCHEME_CHARS = ALPHAS.orGroup(DIGITS).orAny("+-.");
 constexpr auto NOT_SCHEME_CHARS = SCHEME_CHARS.invert();
 
-constexpr auto HOST_CHARS = ALPHAS.orGroup(DIGITS).orAny(".-:[]");  // [] is for ipv6 literals
+constexpr auto HOST_CHARS = ALPHAS.orGroup(DIGITS).orAny(".-:[]_");
+// [] is for ipv6 literals.
+// _ is not allowed in domain names, but the WHATWG URL spec allows it in hostnames, so we do, too.
+// TODO(someday): The URL spec actually allows a lot more than just '_', and requires nameprepping
+//   to Punycode. We'll have to decide how we want to deal with all that.
 
 void toLower(String& text) {
   for (char& c: text) {
@@ -82,10 +117,22 @@ ArrayPtr<const char> split(StringPtr& text, const parse::CharGroup_& chars) {
   return result;
 }
 
-String percentDecode(ArrayPtr<const char> text, bool& hadErrors) {
-  auto result = decodeUriComponent(text);
-  if (result.hadErrors) hadErrors = true;
-  return kj::mv(result);
+String percentDecode(ArrayPtr<const char> text, bool& hadErrors, const Url::Options& options) {
+  if (options.percentDecode) {
+    auto result = decodeUriComponent(text);
+    if (result.hadErrors) hadErrors = true;
+    return kj::mv(result);
+  }
+  return kj::str(text);
+}
+
+String percentDecodeQuery(ArrayPtr<const char> text, bool& hadErrors, const Url::Options& options) {
+  if (options.percentDecode) {
+    auto result = decodeWwwForm(text);
+    if (result.hadErrors) hadErrors = true;
+    return kj::mv(result);
+  }
+  return kj::str(text);
 }
 
 }  // namespace
@@ -105,19 +152,26 @@ Url Url::clone() const {
     KJ_MAP(part, path) { return kj::str(part); },
     hasTrailingSlash,
     KJ_MAP(param, query) -> QueryParam {
-      return { kj::str(param.name), kj::str(param.value) };
+      // Preserve the "allocated-ness" of `param.value` with this careful copy.
+      return { kj::str(param.name), param.value.begin() == nullptr ? kj::String()
+                                                                   : kj::str(param.value) };
     },
-    fragment.map([](const String& s) { return kj::str(s); })
+    fragment.map([](const String& s) { return kj::str(s); }),
+    options
   };
 }
 
-Url Url::parse(StringPtr url, Context context) {
-  return KJ_REQUIRE_NONNULL(tryParse(url, context), "invalid URL", url);
+Url Url::parse(StringPtr url, Context context, Options options) {
+  return KJ_REQUIRE_NONNULL(tryParse(url, context, options), "invalid URL", url);
 }
 
-Maybe<Url> Url::tryParse(StringPtr text, Context context) {
+Maybe<Url> Url::tryParse(StringPtr text, Context context, Options options) {
   Url result;
+  result.options = options;
   bool err = false;  // tracks percent-decoding errors
+
+  auto& END_PATH_PART = getEndPathPart(context);
+  auto& END_QUERY_PART = getEndQueryPart(context);
 
   if (context == HTTP_REQUEST) {
     if (!text.startsWith("/")) {
@@ -154,18 +208,18 @@ Maybe<Url> Url::tryParse(StringPtr text, Context context) {
         }
         KJ_IF_MAYBE(username, trySplit(*userpass, ':')) {
           result.userInfo = UserInfo {
-            percentDecode(*username, err),
-            percentDecode(*userpass, err)
+            percentDecode(*username, err, options),
+            percentDecode(*userpass, err, options)
           };
         } else {
           result.userInfo = UserInfo {
-            percentDecode(*userpass, err),
+            percentDecode(*userpass, err, options),
             nullptr
           };
         }
       }
 
-      result.host = percentDecode(authority, err);
+      result.host = percentDecode(authority, err, options);
       if (!HOST_CHARS.containsAll(result.host)) return nullptr;
       toLower(result.host);
     }
@@ -179,11 +233,12 @@ Maybe<Url> Url::tryParse(StringPtr text, Context context) {
         result.path.removeLast();
       }
       result.hasTrailingSlash = true;
-    } else if (part.size() == 0 || (part.size() == 1 && part[0] == '.')) {
+    } else if ((part.size() == 0 && (!options.allowEmpty || text.size() == 0)) ||
+               (part.size() == 1 && part[0] == '.')) {
       // Collapse consecutive slashes and "/./".
       result.hasTrailingSlash = true;
     } else {
-      result.path.add(percentDecode(part, err));
+      result.path.add(percentDecode(part, err, options));
       result.hasTrailingSlash = false;
     }
   }
@@ -193,11 +248,12 @@ Maybe<Url> Url::tryParse(StringPtr text, Context context) {
       text = text.slice(1);
       auto part = split(text, END_QUERY_PART);
 
-      if (part.size() > 0) {
+      if (part.size() > 0 || options.allowEmpty) {
         KJ_IF_MAYBE(key, trySplit(part, '=')) {
-          result.query.add(QueryParam { percentDecode(*key, err), percentDecode(part, err) });
+          result.query.add(QueryParam { percentDecodeQuery(*key, err, options),
+                                        percentDecodeQuery(part, err, options) });
         } else {
-          result.query.add(QueryParam { percentDecode(part, err), nullptr });
+          result.query.add(QueryParam { percentDecodeQuery(part, err, options), nullptr });
         }
       }
     } while (text.startsWith("&"));
@@ -208,7 +264,7 @@ Maybe<Url> Url::tryParse(StringPtr text, Context context) {
       // No fragment allowed here.
       return nullptr;
     }
-    result.fragment = percentDecode(text.slice(1), err);
+    result.fragment = percentDecode(text.slice(1), err, options);
   } else {
     // We should have consumed everything.
     KJ_ASSERT(text.size() == 0);
@@ -227,7 +283,11 @@ Maybe<Url> Url::tryParseRelative(StringPtr text) const {
   if (text.size() == 0) return clone();
 
   Url result;
+  result.options = options;
   bool err = false;  // tracks percent-decoding errors
+
+  auto& END_PATH_PART = getEndPathPart(Url::REMOTE_HREF);
+  auto& END_QUERY_PART = getEndQueryPart(Url::REMOTE_HREF);
 
   // scheme
   {
@@ -260,18 +320,20 @@ Maybe<Url> Url::tryParseRelative(StringPtr text) const {
     KJ_IF_MAYBE(userpass, trySplit(authority, '@')) {
       KJ_IF_MAYBE(username, trySplit(*userpass, ':')) {
         result.userInfo = UserInfo {
-          percentDecode(*username, err),
-          percentDecode(*userpass, err)
+          percentDecode(*username, err, options),
+          percentDecode(*userpass, err, options)
         };
       } else {
         result.userInfo = UserInfo {
-          percentDecode(*userpass, err),
+          percentDecode(*userpass, err, options),
           nullptr
         };
       }
     }
 
-    result.host = percentDecode(authority, err);
+    result.host = percentDecode(authority, err, options);
+    if (!HOST_CHARS.containsAll(result.host)) return nullptr;
+    toLower(result.host);
   } else {
     // copy authority
     result.host = kj::str(this->host);
@@ -303,7 +365,7 @@ Maybe<Url> Url::tryParseRelative(StringPtr text) const {
     for (;;) {
       auto part = split(text, END_PATH_PART);
       if (part.size() == 2 && part[0] == '.' && part[1] == '.') {
-        if (path.size() != 0) {
+        if (result.path.size() != 0) {
           result.path.removeLast();
         }
         result.hasTrailingSlash = true;
@@ -311,7 +373,7 @@ Maybe<Url> Url::tryParseRelative(StringPtr text) const {
         // Collapse consecutive slashes and "/./".
         result.hasTrailingSlash = true;
       } else {
-        result.path.add(percentDecode(part, err));
+        result.path.add(percentDecode(part, err, options));
         result.hasTrailingSlash = false;
       }
 
@@ -331,21 +393,25 @@ Maybe<Url> Url::tryParseRelative(StringPtr text) const {
 
       if (part.size() > 0) {
         KJ_IF_MAYBE(key, trySplit(part, '=')) {
-          result.query.add(QueryParam { percentDecode(*key, err), percentDecode(part, err) });
+          result.query.add(QueryParam { percentDecodeQuery(*key, err, options),
+                                        percentDecodeQuery(part, err, options) });
         } else {
-          result.query.add(QueryParam { percentDecode(part, err), nullptr });
+          result.query.add(QueryParam { percentDecodeQuery(part, err, options),
+                                        nullptr });
         }
       }
     } while (text.startsWith("&"));
   } else if (!hadNewAuthority && !hadNewPath) {
     // copy query
-    result.query = KJ_MAP(param, this->query) {
-      return QueryParam { kj::str(param.name), kj::str(param.value) };
+    result.query = KJ_MAP(param, this->query) -> QueryParam {
+      // Preserve the "allocated-ness" of `param.value` with this careful copy.
+      return { kj::str(param.name), param.value.begin() == nullptr ? kj::String()
+                                                                   : kj::str(param.value) };
     };
   }
 
   if (text.startsWith("#")) {
-    result.fragment = percentDecode(text.slice(1), err);
+    result.fragment = percentDecode(text.slice(1), err, options);
   } else {
     // We should have consumed everything.
     KJ_ASSERT(text.size() == 0);
@@ -365,10 +431,11 @@ String Url::toString(Context context) const {
 
     if (context == REMOTE_HREF) {
       KJ_IF_MAYBE(user, userInfo) {
-        chars.addAll(encodeUriComponent(user->username));
+        chars.addAll(options.percentDecode ? encodeUriUserInfo(user->username)
+                                          : kj::str(user->username));
         KJ_IF_MAYBE(pass, user->password) {
           chars.add(':');
-          chars.addAll(encodeUriComponent(*pass));
+          chars.addAll(options.percentDecode ? encodeUriUserInfo(*pass) : kj::str(*pass));
         }
         chars.add('@');
       }
@@ -392,12 +459,12 @@ String Url::toString(Context context) const {
 
   for (auto& pathPart: path) {
     // Protect against path injection.
-    KJ_REQUIRE(pathPart != "" && pathPart != "." && pathPart != "..",
-               "invalid name in URL path", *this) {
+    KJ_REQUIRE((pathPart != "" || options.allowEmpty) && pathPart != "." && pathPart != "..",
+               "invalid name in URL path", path) {
       continue;
     }
     chars.add('/');
-    chars.addAll(encodeUriComponent(pathPart));
+    chars.addAll(options.percentDecode ? encodeUriPath(pathPart) : kj::str(pathPart));
   }
   if (hasTrailingSlash || (path.size() == 0 && context == HTTP_REQUEST)) {
     chars.add('/');
@@ -407,17 +474,17 @@ String Url::toString(Context context) const {
   for (auto& param: query) {
     chars.add(first ? '?' : '&');
     first = false;
-    chars.addAll(encodeUriComponent(param.name));
-    if (param.value.size() > 0) {
+    chars.addAll(options.percentDecode ? encodeWwwForm(param.name) : kj::str(param.name));
+    if (param.value.begin() != nullptr) {
       chars.add('=');
-      chars.addAll(encodeUriComponent(param.value));
+      chars.addAll(options.percentDecode ? encodeWwwForm(param.value) : kj::str(param.value));
     }
   }
 
   if (context == REMOTE_HREF) {
     KJ_IF_MAYBE(f, fragment) {
       chars.add('#');
-      chars.addAll(encodeUriComponent(*f));
+      chars.addAll(options.percentDecode ? encodeUriFragment(*f) : kj::str(*f));
     }
   }
 

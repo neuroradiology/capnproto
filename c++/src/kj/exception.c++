@@ -19,6 +19,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#if (_WIN32 && _M_X64) || (__CYGWIN__ && __x86_64__)
+// Currently the Win32 stack-trace code only supports x86_64. We could easily extend it to support
+// i386 as well but it requires some code changes around how we read the context to start the
+// trace.
+#define KJ_USE_WIN32_DBGHELP 1
+#endif
+
 #include "exception.h"
 #include "string.h"
 #include "debug.h"
@@ -35,21 +46,33 @@
 #endif
 #include "io.h"
 
+#if !KJ_NO_RTTI
+#include <typeinfo>
+#endif
+#if __GNUC__
+#include <cxxabi.h>
+#endif
+
 #if (__linux__ && __GLIBC__ && !__UCLIBC__) || __APPLE__
 #define KJ_HAS_BACKTRACE 1
 #include <execinfo.h>
 #endif
 
-#if _WIN32
+#if _WIN32 || __CYGWIN__
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "windows-sanity.h"
 #include <dbghelp.h>
 #endif
 
-#if (__linux__ || __APPLE__)
+#if (__linux__ || __APPLE__ || __CYGWIN__)
 #include <stdio.h>
 #include <pthread.h>
+#endif
+
+#if __CYGWIN__
+#include <sys/cygwin.h>
+#include <ucontext.h>
 #endif
 
 #if KJ_HAS_LIBDL
@@ -70,10 +93,7 @@ StringPtr KJ_STRINGIFY(LogSeverity severity) {
   return SEVERITY_STRINGS[static_cast<uint>(severity)];
 }
 
-#if _WIN32 && _M_X64
-// Currently the Win32 stack-trace code only supports x86_64. We could easily extend it to support
-// i386 as well but it requires some code changes around how we read the context to start the
-// trace.
+#if KJ_USE_WIN32_DBGHELP
 
 namespace {
 
@@ -125,6 +145,13 @@ const Dbghelp& getDbghelp() {
 
 ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount,
                                     HANDLE thread, CONTEXT& context) {
+  // NOTE: Apparently there is a function CaptureStackBackTrace() that is equivalent to glibc's
+  //   backtrace(). Somehow I missed that when I originally wrote this. However,
+  //   CaptureStackBackTrace() does not accept a CONTEXT parameter; it can only trace the caller.
+  //   That's more problematic on Windows where breakHandler(), sehHandler(), and Cygwin signal
+  //   handlers all depend on the ability to pass a CONTEXT. So we'll keep this code, which works
+  //   after all.
+
   const Dbghelp& dbghelp = getDbghelp();
   if (dbghelp.stackWalk64 == nullptr ||
       dbghelp.symFunctionTableAccess64 == nullptr ||
@@ -152,7 +179,9 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount,
       break;
     }
 
-    space[count] = reinterpret_cast<void*>(frame.AddrPC.Offset);
+    // Subtract 1 from each address so that we identify the calling instructions, rather than the
+    // return addresses (which are typically the instruction after the call).
+    space[count] = reinterpret_cast<void*>(frame.AddrPC.Offset - 1);
   }
 
   return space.slice(kj::min(ignoreCount, count), count);
@@ -166,7 +195,7 @@ ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space, uint ignoreCount) {
     return nullptr;
   }
 
-#if _WIN32 && _M_X64
+#if KJ_USE_WIN32_DBGHELP
   CONTEXT context;
   RtlCaptureContext(&context);
   return getStackTrace(space, ignoreCount, GetCurrentThread(), context);
@@ -194,7 +223,7 @@ String stringifyStackTrace(ArrayPtr<void* const> trace) {
     return nullptr;
   }
 
-#if _WIN32 && _M_X64 && _MSC_VER
+#if KJ_USE_WIN32_DBGHELP && _MSC_VER
 
   // Try to get file/line using SymGetLineFromAddr64(). We don't bother if we aren't on MSVC since
   // this requires MSVC debug info.
@@ -219,7 +248,7 @@ String stringifyStackTrace(ArrayPtr<void* const> trace) {
 
   return strArray(lines, "");
 
-#elif (__linux__ || __APPLE__) && !__ANDROID__
+#elif (__linux__ || __APPLE__ || __CYGWIN__) && !__ANDROID__
   // We want to generate a human-readable stack trace.
 
   // TODO(someday):  It would be really great if we could avoid farming out to another process
@@ -261,6 +290,16 @@ String stringifyStackTrace(ArrayPtr<void* const> trace) {
   // The Mac OS X equivalent of addr2line is atos.
   // (Internally, it uses the private CoreSymbolication.framework library.)
   p = popen(str("xcrun atos -p ", getpid(), ' ', strTrace).cStr(), "r");
+#elif __CYGWIN__
+  wchar_t exeWinPath[MAX_PATH];
+  if (GetModuleFileNameW(nullptr, exeWinPath, sizeof(exeWinPath)) == 0) {
+    return nullptr;
+  }
+  char exePosixPath[MAX_PATH * 2];
+  if (cygwin_conv_path(CCP_WIN_W_TO_POSIX, exeWinPath, exePosixPath, sizeof(exePosixPath)) < 0) {
+    return nullptr;
+  }
+  p = popen(str("addr2line -e '", exePosixPath, "' ", strTrace).cStr(), "r");
 #endif
 
   if (p == nullptr) {
@@ -323,13 +362,86 @@ String stringifyStackTraceAddresses(ArrayPtr<void* const> trace) {
 #endif
 }
 
+StringPtr stringifyStackTraceAddresses(ArrayPtr<void* const> trace, ArrayPtr<char> scratch) {
+  // Version which writes into a pre-allocated buffer. This is safe for signal handlers to the
+  // extent that dladdr() is safe.
+  //
+  // TODO(cleanup): We should improve the KJ stringification framework so that there's a way to
+  //   write this string directly into a larger message buffer with strPreallocated().
+
+#if KJ_HAS_LIBDL
+  char* ptr = scratch.begin();
+  char* limit = scratch.end() - 1;
+
+  for (auto addr: trace) {
+    Dl_info info;
+    // Shared libraries are mapped near the end of the address space while the executable is mapped
+    // near the beginning. We want to print addresses in the executable as raw addresses, not
+    // offsets, since that's what addr2line expects for executables. For shared libraries it
+    // expects offsets. In any case, most frames are likely to be in the main executable so it
+    // makes the output cleaner if we don't repeatedly write its name.
+    if (reinterpret_cast<uintptr_t>(addr) >= 0x400000000000ull && dladdr(addr, &info)) {
+      uintptr_t offset = reinterpret_cast<uintptr_t>(addr) -
+                         reinterpret_cast<uintptr_t>(info.dli_fbase);
+      ptr = _::fillLimited(ptr, limit, kj::StringPtr(info.dli_fname), "@0x"_kj, hex(offset));
+    } else {
+      ptr = _::fillLimited(ptr, limit, toCharSequence(addr));
+    }
+
+    ptr = _::fillLimited(ptr, limit, " "_kj);
+  }
+  *ptr = '\0';
+  return StringPtr(scratch.begin(), ptr);
+#else
+  // TODO(someday): Support other platforms.
+  return kj::strPreallocated(scratch, kj::delimited(trace, " "));
+#endif
+}
+
 String getStackTrace() {
   void* space[32];
   auto trace = getStackTrace(space, 2);
   return kj::str(stringifyStackTraceAddresses(trace), stringifyStackTrace(trace));
 }
 
-#if _WIN32 && _M_X64
+namespace {
+
+void terminateHandler() {
+  void* traceSpace[32];
+
+  // ignoreCount = 3 to ignore std::terminate entry.
+  auto trace = kj::getStackTrace(traceSpace, 3);
+
+  kj::String message;
+
+  auto eptr = std::current_exception();
+  if (eptr != nullptr) {
+    try {
+      std::rethrow_exception(eptr);
+    } catch (const kj::Exception& exception) {
+      message = kj::str("*** Fatal uncaught kj::Exception: ", exception, '\n');
+    } catch (const std::exception& exception) {
+      message = kj::str("*** Fatal uncaught std::exception: ", exception.what(),
+                        "\nstack: ", stringifyStackTraceAddresses(trace),
+                                     stringifyStackTrace(trace), '\n');
+    } catch (...) {
+      message = kj::str("*** Fatal uncaught exception of type: ", kj::getCaughtExceptionType(),
+                        "\nstack: ", stringifyStackTraceAddresses(trace),
+                                     stringifyStackTrace(trace), '\n');
+    }
+  } else {
+    message = kj::str("*** std::terminate() called with no exception"
+                      "\nstack: ", stringifyStackTraceAddresses(trace),
+                                   stringifyStackTrace(trace), '\n');
+  }
+
+  kj::FdOutputStream(STDERR_FILENO).write(message.begin(), message.size());
+  _exit(1);
+}
+
+}  // namespace
+
+#if KJ_USE_WIN32_DBGHELP && !__CYGWIN__
 namespace {
 
 DWORD mainThreadId = 0;
@@ -346,7 +458,7 @@ BOOL WINAPI breakHandler(DWORD type) {
           context.ContextFlags = CONTEXT_FULL;
           if (GetThreadContext(thread, &context)) {
             void* traceSpace[32];
-            auto trace = getStackTrace(traceSpace, 2, thread, context);
+            auto trace = getStackTrace(traceSpace, 0, thread, context);
             ResumeThread(thread);
             auto message = kj::str("*** Received CTRL+C. stack: ",
                                    stringifyStackTraceAddresses(trace),
@@ -367,21 +479,86 @@ BOOL WINAPI breakHandler(DWORD type) {
   return FALSE;  // still crash
 }
 
+kj::StringPtr exceptionDescription(DWORD code) {
+  switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION: return "access violation";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "array bounds exceeded";
+    case EXCEPTION_BREAKPOINT: return "breakpoint";
+    case EXCEPTION_DATATYPE_MISALIGNMENT: return "datatype misalignment";
+    case EXCEPTION_FLT_DENORMAL_OPERAND: return "denormal floating point operand";
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO: return "floating point division by zero";
+    case EXCEPTION_FLT_INEXACT_RESULT: return "inexact floating point result";
+    case EXCEPTION_FLT_INVALID_OPERATION: return "invalid floating point operation";
+    case EXCEPTION_FLT_OVERFLOW: return "floating point overflow";
+    case EXCEPTION_FLT_STACK_CHECK: return "floating point stack overflow";
+    case EXCEPTION_FLT_UNDERFLOW: return "floating point underflow";
+    case EXCEPTION_ILLEGAL_INSTRUCTION: return "illegal instruction";
+    case EXCEPTION_IN_PAGE_ERROR: return "page error";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO: return "integer divided by zero";
+    case EXCEPTION_INT_OVERFLOW: return "integer overflow";
+    case EXCEPTION_INVALID_DISPOSITION: return "invalid disposition";
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "noncontinuable exception";
+    case EXCEPTION_PRIV_INSTRUCTION: return "privileged instruction";
+    case EXCEPTION_SINGLE_STEP: return "single step";
+    case EXCEPTION_STACK_OVERFLOW: return "stack overflow";
+    default: return "(unknown exception code)";
+  }
+}
+
+LONG WINAPI sehHandler(EXCEPTION_POINTERS* info) {
+  void* traceSpace[32];
+  auto trace = getStackTrace(traceSpace, 0, GetCurrentThread(), *info->ContextRecord);
+  auto message = kj::str("*** Received structured exception #0x",
+                         hex(info->ExceptionRecord->ExceptionCode), ": ",
+                         exceptionDescription(info->ExceptionRecord->ExceptionCode),
+                         "; stack: ",
+                         stringifyStackTraceAddresses(trace),
+                         stringifyStackTrace(trace), '\n');
+  FdOutputStream(STDERR_FILENO).write(message.begin(), message.size());
+  return EXCEPTION_EXECUTE_HANDLER;  // still crash
+}
+
 }  // namespace
 
 void printStackTraceOnCrash() {
   mainThreadId = GetCurrentThreadId();
   KJ_WIN32(SetConsoleCtrlHandler(breakHandler, TRUE));
+  SetUnhandledExceptionFilter(&sehHandler);
+
+  // Also override std::terminate() handler with something nicer for KJ.
+  std::set_terminate(&terminateHandler);
 }
 
-#elif KJ_HAS_BACKTRACE
+#elif _WIN32
+// Windows, but KJ_USE_WIN32_DBGHELP is not enabled. We can't print useful stack traces, so don't
+// try to catch SEH nor ctrl+C.
+
+void printStackTraceOnCrash() {
+  std::set_terminate(&terminateHandler);
+}
+
+#else
 namespace {
 
 void crashHandler(int signo, siginfo_t* info, void* context) {
   void* traceSpace[32];
 
+#if KJ_USE_WIN32_DBGHELP
+  // Win32 backtracing can't trace its way out of a Cygwin signal handler. However, Cygwin gives
+  // us direct access to the CONTEXT, which we can pass to the Win32 tracing functions.
+  ucontext_t* ucontext = reinterpret_cast<ucontext_t*>(context);
+  // Cygwin's mcontext_t has the same layout as CONTEXT.
+  // TODO(someday): Figure out why this produces garbage for SIGINT from ctrl+C. It seems to work
+  //   correctly for SIGSEGV.
+  CONTEXT win32Context;
+  static_assert(sizeof(ucontext->uc_mcontext) >= sizeof(win32Context),
+      "mcontext_t should be an extension of CONTEXT");
+  memcpy(&win32Context, &ucontext->uc_mcontext, sizeof(win32Context));
+  auto trace = getStackTrace(traceSpace, 0, GetCurrentThread(), win32Context);
+#else
   // ignoreCount = 2 to ignore crashHandler() and signal trampoline.
   auto trace = getStackTrace(traceSpace, 2);
+#endif
 
   auto message = kj::str("*** Received signal #", signo, ": ", strsignal(signo),
                          "\nstack: ", stringifyStackTraceAddresses(trace),
@@ -434,9 +611,9 @@ void printStackTraceOnCrash() {
   // because stack traces on ctrl+c can be obnoxious for, say, command-line tools.
   KJ_SYSCALL(sigaction(SIGINT, &action, nullptr));
 #endif
-}
-#else
-void printStackTraceOnCrash() {
+
+  // Also override std::terminate() handler with something nicer for KJ.
+  std::set_terminate(&terminateHandler);
 }
 #endif
 
@@ -792,7 +969,13 @@ void throwRecoverableException(kj::Exception&& exception, uint ignoreCount) {
 
 namespace _ {  // private
 
-#if __GNUC__
+#if __cplusplus >= 201703L
+
+uint uncaughtExceptionCount() {
+  return std::uncaught_exceptions();
+}
+
+#elif __GNUC__
 
 // Horrible -- but working -- hack:  We can dig into __cxa_get_globals() in order to extract the
 // count of uncaught exceptions.  This function is part of the C++ ABI implementation used on Linux,
@@ -816,17 +999,16 @@ struct FakeEhGlobals {
   uint uncaughtExceptions;
 };
 
-// Because of the 'extern "C"', the symbol name is not mangled and thus the namespace is effectively
-// ignored for linking.  Thus it doesn't matter that we are declaring __cxa_get_globals() in a
-// different namespace from the ABI's definition.
-extern "C" {
-FakeEhGlobals* __cxa_get_globals();
-}
+// LLVM's libstdc++ doesn't declare __cxa_get_globals in its cxxabi.h. GNU does. Because it is
+// extern "C", the compiler wills get upset if we re-declare it even in a different namespace.
+#if _LIBCPPABI_VERSION
+extern "C" void* __cxa_get_globals();
+#else
+using abi::__cxa_get_globals;
+#endif
 
 uint uncaughtExceptionCount() {
-  // TODO(perf):  Use __cxa_get_globals_fast()?  Requires that __cxa_get_globals() has been called
-  //   from somewhere.
-  return __cxa_get_globals()->uncaughtExceptions;
+  return reinterpret_cast<FakeEhGlobals*>(__cxa_get_globals())->uncaughtExceptions;
 }
 
 #elif _MSC_VER
@@ -876,6 +1058,26 @@ void UnwindDetector::catchExceptionsAsSecondaryFaults(_::Runnable& runnable) con
   runCatchingExceptions(runnable);
 }
 
+#if __GNUC__ && !KJ_NO_RTTI
+static kj::String demangleTypeName(const char* name) {
+  if (name == nullptr) return kj::heapString("(nil)");
+
+  int status;
+  char* buf = abi::__cxa_demangle(name, nullptr, nullptr, &status);
+  kj::String result = kj::heapString(buf == nullptr ? name : buf);
+  free(buf);
+  return kj::mv(result);
+}
+
+kj::String getCaughtExceptionType() {
+  return demangleTypeName(abi::__cxa_current_exception_type()->name());
+}
+#else
+kj::String getCaughtExceptionType() {
+  return kj::heapString("(unknown)");
+}
+#endif
+
 namespace _ {  // private
 
 class RecoverableExceptionCatcher: public ExceptionCallback {
@@ -918,8 +1120,12 @@ Maybe<Exception> runCatchingExceptions(Runnable& runnable) noexcept {
     return Exception(Exception::Type::FAILED,
                      "(unknown)", -1, str("std::exception: ", e.what()));
   } catch (...) {
-    return Exception(Exception::Type::FAILED,
-                     "(unknown)", -1, str("Unknown non-KJ exception."));
+#if __GNUC__ && !KJ_NO_RTTI
+    return Exception(Exception::Type::FAILED, "(unknown)", -1, str(
+        "unknown non-KJ exception of type: ", getCaughtExceptionType()));
+#else
+    return Exception(Exception::Type::FAILED, "(unknown)", -1, str("unknown non-KJ exception"));
+#endif
   }
 #endif
 }

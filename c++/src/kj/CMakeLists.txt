@@ -10,16 +10,22 @@ set(kj_sources_lite
   memory.c++
   mutex.c++
   string.c++
+  hash.c++
+  table.c++
   thread.c++
   main.c++
   arena.c++
   test-helpers.c++
+  units.c++
+  encoding.c++
 )
 set(kj_sources_heavy
-  units.c++
   refcount.c++
   string-tree.c++
-  encoding.c++
+  time.c++
+  filesystem.c++
+  filesystem-disk-unix.c++
+  filesystem-disk-win32.c++
   parse/char.c++
 )
 if(NOT CAPNP_LITE)
@@ -37,6 +43,9 @@ set(kj_headers
   vector.h
   string.h
   string-tree.h
+  hash.h
+  table.h
+  map.h
   encoding.h
   exception.h
   debug.h
@@ -48,6 +57,8 @@ set(kj_headers
   mutex.h
   thread.h
   threadlocal.h
+  filesystem.h
+  time.h
   main.h
   windows-sanity.h
 )
@@ -60,8 +71,8 @@ set(kj-std_headers
 )
 add_library(kj ${kj_sources})
 add_library(CapnProto::kj ALIAS kj)
-target_compile_features(kj PUBLIC cxx_constexpr)
-# Requiring the cxx_std_11 metafeature would be preferable, but that doesn't exist until CMake 3.8.
+# TODO(cleanup): Use cxx_std_14 once it's safe to require cmake 3.8.
+target_compile_features(kj PUBLIC cxx_generic_lambdas)
 
 if(UNIX AND NOT ANDROID)
   target_link_libraries(kj PUBLIC pthread)
@@ -105,7 +116,7 @@ set(kj-async_sources
   async-io-win32.c++
   async-io.c++
   async-io-unix.c++
-  time.c++
+  timer.c++
 )
 set(kj-async_headers
   async-prelude.h
@@ -114,7 +125,7 @@ set(kj-async_headers
   async-unix.h
   async-win32.h
   async-io.h
-  time.h
+  timer.h
 )
 if(NOT CAPNP_LITE)
   add_library(kj-async ${kj-async_sources})
@@ -152,6 +163,31 @@ if(NOT CAPNP_LITE)
   install(FILES ${kj-http_headers} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/kj/compat")
 endif()
 
+# kj-gzip ======================================================================
+
+set(kj-gzip_sources
+  compat/gzip.c++
+)
+set(kj-gzip_headers
+  compat/gzip.h
+)
+if(NOT CAPNP_LITE)
+  add_library(kj-gzip ${kj-gzip_sources})
+  add_library(CapnProto::kj-gzip ALIAS kj-gzip)
+
+  find_package(ZLIB)
+  if(ZLIB_FOUND)
+    add_definitions(-D KJ_HAS_ZLIB=1)
+    include_directories(${ZLIB_INCLUDE_DIRS})
+    target_link_libraries(kj-gzip PUBLIC kj-async kj ${ZLIB_LIBRARIES})
+  endif()
+
+  # Ensure the library has a version set to match autotools build
+  set_target_properties(kj-gzip PROPERTIES VERSION ${VERSION})
+  install(TARGETS kj-gzip ${INSTALL_TARGETS_DEFAULT_ARGS})
+  install(FILES ${kj-gzip_headers} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/kj/compat")
+endif()
+
 # Tests ========================================================================
 
 if(BUILD_TESTING)
@@ -160,10 +196,13 @@ if(BUILD_TESTING)
     memory-test.c++
     array-test.c++
     string-test.c++
+    table-test.c++
+    map-test.c++
     exception-test.c++
     debug-test.c++
     io-test.c++
     mutex-test.c++
+    time-test.c++
     threadlocal-test.c++
     test-test.c++
     std/iostream-test.c++
@@ -176,8 +215,11 @@ if(BUILD_TESTING)
   if(NOT CAPNP_LITE)
     add_executable(kj-heavy-tests
       async-test.c++
+      async-xthread-test.c++
       async-unix-test.c++
+      async-unix-xthread-test.c++
       async-win32-test.c++
+      async-win32-xthread-test.c++
       async-io-test.c++
       refcount-test.c++
       string-tree-test.c++
@@ -188,12 +230,15 @@ if(BUILD_TESTING)
       one-of-test.c++
       function-test.c++
       threadlocal-pthread-test.c++
+      filesystem-test.c++
+      filesystem-disk-test.c++
       parse/common-test.c++
       parse/char-test.c++
       compat/url-test.c++
       compat/http-test.c++
+      compat/gzip-test.c++
     )
-    target_link_libraries(kj-heavy-tests kj-http kj-async kj-test kj)
+    target_link_libraries(kj-heavy-tests kj-http kj-gzip kj-async kj-test kj)
     add_dependencies(check kj-heavy-tests)
     add_test(NAME kj-heavy-tests-run COMMAND kj-heavy-tests)
   endif()  # NOT CAPNP_LITE

@@ -20,115 +20,240 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#if _WIN32
+#define WIN32_LEAN_AND_MEAN 1  // lolz
+#define WINVER 0x0600
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include "time.h"
 #include "debug.h"
 #include <set>
 
+#if _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 namespace kj {
 
-kj::Exception Timer::makeTimeoutException() {
-  return KJ_EXCEPTION(OVERLOADED, "operation timed out");
-}
-
-Clock& nullClock() {
+const Clock& nullClock() {
   class NullClock final: public Clock {
   public:
-    Date now() override { return UNIX_EPOCH; }
+    Date now() const override { return UNIX_EPOCH; }
   };
-  static NullClock NULL_CLOCK;
+  static KJ_CONSTEXPR(const) NullClock NULL_CLOCK = NullClock();
   return NULL_CLOCK;
 }
 
-struct TimerImpl::Impl {
-  struct TimerBefore {
-    bool operator()(TimerPromiseAdapter* lhs, TimerPromiseAdapter* rhs);
-  };
-  using Timers = std::multiset<TimerPromiseAdapter*, TimerBefore>;
-  Timers timers;
+#if _WIN32
+
+namespace {
+
+static constexpr int64_t WIN32_EPOCH_OFFSET = 116444736000000000ull;
+// Number of 100ns intervals from Jan 1, 1601 to Jan 1, 1970.
+
+static Date toKjDate(FILETIME t) {
+  int64_t value = (static_cast<uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+  return (value - WIN32_EPOCH_OFFSET) * (100 * kj::NANOSECONDS) + UNIX_EPOCH;
+}
+
+class Win32CoarseClock: public Clock {
+public:
+  Date now() const override {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return toKjDate(ft);
+  }
 };
 
-class TimerImpl::TimerPromiseAdapter {
+class Win32PreciseClock: public Clock {
+  typedef VOID WINAPI GetSystemTimePreciseAsFileTimeFunc(LPFILETIME);
 public:
-  TimerPromiseAdapter(PromiseFulfiller<void>& fulfiller, TimerImpl::Impl& impl, TimePoint time)
-      : time(time), fulfiller(fulfiller), impl(impl) {
-    pos = impl.timers.insert(this);
-  }
-
-  ~TimerPromiseAdapter() {
-    if (pos != impl.timers.end()) {
-      impl.timers.erase(pos);
+  Date now() const override {
+    static const GetSystemTimePreciseAsFileTimeFunc* getSystemTimePreciseAsFileTimePtr =
+        getGetSystemTimePreciseAsFileTime();
+    FILETIME ft;
+    if (getSystemTimePreciseAsFileTimePtr == nullptr) {
+      // We can't use QueryPerformanceCounter() to get any more precision because we have no way
+      // of knowing when the calendar clock jumps. So I guess we're stuck.
+      GetSystemTimeAsFileTime(&ft);
+    } else {
+      getSystemTimePreciseAsFileTimePtr(&ft);
     }
+    return toKjDate(ft);
   }
-
-  void fulfill() {
-    fulfiller.fulfill();
-    impl.timers.erase(pos);
-    pos = impl.timers.end();
-  }
-
-  const TimePoint time;
 
 private:
-  PromiseFulfiller<void>& fulfiller;
-  TimerImpl::Impl& impl;
-  Impl::Timers::const_iterator pos;
+  static GetSystemTimePreciseAsFileTimeFunc* getGetSystemTimePreciseAsFileTime() {
+    // Dynamically look up the function GetSystemTimePreciseAsFileTimeFunc(). This was only
+    // introduced as of Windows 8, so it might be missing.
+    return reinterpret_cast<GetSystemTimePreciseAsFileTimeFunc*>(GetProcAddress(
+      GetModuleHandleA("kernel32.dll"),
+      "GetSystemTimePreciseAsFileTime"));
+  }
 };
 
-inline bool TimerImpl::Impl::TimerBefore::operator()(
-    TimerPromiseAdapter* lhs, TimerPromiseAdapter* rhs) {
-  return lhs->time < rhs->time;
-}
-
-Promise<void> TimerImpl::atTime(TimePoint time) {
-  return newAdaptedPromise<void, TimerPromiseAdapter>(*impl, time);
-}
-
-Promise<void> TimerImpl::afterDelay(Duration delay) {
-  return newAdaptedPromise<void, TimerPromiseAdapter>(*impl, time + delay);
-}
-
-TimerImpl::TimerImpl(TimePoint startTime)
-    : time(startTime), impl(heap<Impl>()) {}
-
-TimerImpl::~TimerImpl() noexcept(false) {}
-
-Maybe<TimePoint> TimerImpl::nextEvent() {
-  auto iter = impl->timers.begin();
-  if (iter == impl->timers.end()) {
-    return nullptr;
-  } else {
-    return (*iter)->time;
+class Win32CoarseMonotonicClock: public MonotonicClock {
+public:
+  TimePoint now() const override {
+    return kj::origin<TimePoint>() + GetTickCount64() * kj::MILLISECONDS;
   }
-}
+};
 
-Maybe<uint64_t> TimerImpl::timeoutToNextEvent(TimePoint start, Duration unit, uint64_t max) {
-  return nextEvent().map([&](TimePoint nextTime) -> uint64_t {
-    if (nextTime <= start) return 0;
+class Win32PreciseMonotonicClock: public MonotonicClock {
+  // Precise clock implemented using QueryPerformanceCounter().
+  //
+  // TODO(someday): Windows 10 has QueryUnbiasedInterruptTime() and
+  //   QueryUnbiasedInterruptTimePrecise(), a new API for monotonic timing that isn't as difficult.
+  //   Is there any benefit to dynamically checking for these and using them if available?
 
-    Duration timeout = nextTime - start;
+public:
+  TimePoint now() const override {
+    static const QpcProperties props;
 
-    uint64_t result = timeout / unit;
-    bool roundUp = timeout % unit > 0 * SECONDS;
-
-    if (result >= max) {
-      return max;
-    } else {
-      return result + roundUp;
-    }
-  });
-}
-
-void TimerImpl::advanceTo(TimePoint newTime) {
-  KJ_REQUIRE(newTime >= time, "can't advance backwards in time") { return; }
-
-  time = newTime;
-  for (;;) {
-    auto front = impl->timers.begin();
-    if (front == impl->timers.end() || (*front)->time > time) {
-      break;
-    }
-    (*front)->fulfill();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    uint64_t adjusted = now.QuadPart - props.origin;
+    uint64_t ns = mulDiv64(adjusted, 1'000'000'000, props.frequency);
+    return kj::origin<TimePoint>() + ns * kj::NANOSECONDS;
   }
+
+private:
+  struct QpcProperties {
+    uint64_t origin;
+    // What QueryPerformanceCounter() would have returned at the time when GetTickCount64() returned
+    // zero. Used to ensure that the coarse and precise timers return similar values.
+
+    uint64_t frequency;
+    // From QueryPerformanceFrequency().
+
+    QpcProperties() {
+      LARGE_INTEGER now, freqLi;
+      uint64_t ticks = GetTickCount64();
+      QueryPerformanceCounter(&now);
+
+      QueryPerformanceFrequency(&freqLi);
+      frequency = freqLi.QuadPart;
+
+      // Convert the millisecond tick count into performance counter ticks.
+      uint64_t ticksAsQpc = mulDiv64(ticks, freqLi.QuadPart, 1000);
+
+      origin = now.QuadPart - ticksAsQpc;
+    }
+  };
+
+  static inline uint64_t mulDiv64(uint64_t value, uint64_t numer, uint64_t denom) {
+    // Inspired by:
+    //   https://github.com/rust-lang/rust/pull/22788/files#diff-24f054cd23f65af3b574c6ce8aa5a837R54
+    // Computes (value*numer)/denom without overflow, as long as both
+    // (numer*denom) and the overall result fit into 64 bits.
+    uint64_t q = value / denom;
+    uint64_t r = value % denom;
+    return q * numer + r * numer / denom;
+  }
+};
+
+}  // namespace
+
+const Clock& systemCoarseCalendarClock() {
+  static constexpr Win32CoarseClock clock;
+  return clock;
 }
+const Clock& systemPreciseCalendarClock() {
+  static constexpr Win32PreciseClock clock;
+  return clock;
+}
+
+const MonotonicClock& systemCoarseMonotonicClock() {
+  static constexpr Win32CoarseMonotonicClock clock;
+  return clock;
+}
+const MonotonicClock& systemPreciseMonotonicClock() {
+  static constexpr Win32PreciseMonotonicClock clock;
+  return clock;
+}
+
+#else
+
+namespace {
+
+class PosixClock: public Clock {
+public:
+  constexpr PosixClock(clockid_t clockId): clockId(clockId) {}
+
+  Date now() const override {
+    struct timespec ts;
+    KJ_SYSCALL(clock_gettime(clockId, &ts));
+    return UNIX_EPOCH + ts.tv_sec * kj::SECONDS + ts.tv_nsec * kj::NANOSECONDS;
+  }
+
+private:
+  clockid_t clockId;
+};
+
+class PosixMonotonicClock: public MonotonicClock {
+public:
+  constexpr PosixMonotonicClock(clockid_t clockId): clockId(clockId) {}
+
+  TimePoint now() const override {
+    struct timespec ts;
+    KJ_SYSCALL(clock_gettime(clockId, &ts));
+    return kj::origin<TimePoint>() + ts.tv_sec * kj::SECONDS + ts.tv_nsec * kj::NANOSECONDS;
+  }
+
+private:
+  clockid_t clockId;
+};
+
+}  // namespace
+
+// FreeBSD has "_PRECISE", but Linux just defaults to precise.
+#ifndef CLOCK_REALTIME_PRECISE
+#define CLOCK_REALTIME_PRECISE CLOCK_REALTIME
+#endif
+
+#ifndef CLOCK_MONOTONIC_PRECISE
+#define CLOCK_MONOTONIC_PRECISE CLOCK_MONOTONIC
+#endif
+
+// FreeBSD has "_FAST", Linux has "_COARSE".
+// MacOS has an "_APPROX" but only for CLOCK_MONOTONIC_RAW, which isn't helpful.
+#ifndef CLOCK_REALTIME_COARSE
+#ifdef CLOCK_REALTIME_FAST
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME_FAST
+#else
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#endif
+
+#ifndef CLOCK_MONOTONIC_COARSE
+#ifdef CLOCK_MONOTONIC_FAST
+#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC_FAST
+#else
+#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
+#endif
+#endif
+
+const Clock& systemCoarseCalendarClock() {
+  static constexpr PosixClock clock(CLOCK_REALTIME_COARSE);
+  return clock;
+}
+const Clock& systemPreciseCalendarClock() {
+  static constexpr PosixClock clock(CLOCK_REALTIME_PRECISE);
+  return clock;
+}
+
+const MonotonicClock& systemCoarseMonotonicClock() {
+  static constexpr PosixMonotonicClock clock(CLOCK_MONOTONIC_COARSE);
+  return clock;
+}
+const MonotonicClock& systemPreciseMonotonicClock() {
+  static constexpr PosixMonotonicClock clock(CLOCK_MONOTONIC_PRECISE);
+  return clock;
+}
+
+#endif
 
 }  // namespace kj

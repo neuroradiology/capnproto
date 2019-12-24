@@ -19,12 +19,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef CAPNP_COMPILER_NODE_TRANSLATOR_H_
-#define CAPNP_COMPILER_NODE_TRANSLATOR_H_
-
-#if defined(__GNUC__) && !defined(CAPNP_HEADER_WARNINGS)
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include <capnp/orphan.h>
 #include <capnp/compiler/grammar.capnp.h>
@@ -34,6 +29,8 @@
 #include <kj/one-of.h>
 #include "error-reporter.h"
 #include <map>
+
+CAPNP_BEGIN_HEADER
 
 namespace capnp {
 namespace compiler {
@@ -320,4 +317,4 @@ private:
 }  // namespace compiler
 }  // namespace capnp
 
-#endif  // CAPNP_COMPILER_NODE_TRANSLATOR_H_
+CAPNP_END_HEADER

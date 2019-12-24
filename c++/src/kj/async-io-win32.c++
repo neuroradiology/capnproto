@@ -189,17 +189,6 @@ int win32Socketpair(SOCKET socks[2]) {
 
 namespace {
 
-bool detectWine() {
-  HMODULE hntdll = GetModuleHandle("ntdll.dll");
-  if(hntdll == NULL) return false;
-  return GetProcAddress(hntdll, "wine_get_version") != nullptr;
-}
-
-bool isWine() {
-  static bool result = detectWine();
-  return result;
-}
-
 // =======================================================================================
 
 static constexpr uint NEW_FD_FLAGS = LowLevelAsyncIoProvider::TAKE_OWNERSHIP;
@@ -309,6 +298,23 @@ public:
       // Enable shutdown() to work.
       setsockopt(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
     });
+  }
+
+  Promise<void> whenWriteDisconnected() override {
+    // Windows IOCP does not provide a direct, documented way to detect when the socket disconnects
+    // without actually doing a read or write. However, there is an undocoumented-but-stable
+    // ioctl called IOCTL_AFD_POLL which can be used for this purpose. In fact, select() is
+    // implemented in terms of this ioctl -- performed synchronously -- but it's entirely possible
+    // to put only one socket into the list and perform the ioctl asynchronously. Here's the
+    // source code for select() in Windows 2000 (not sure how this became public...):
+    //
+    //     https://github.com/pustladi/Windows-2000/blob/661d000d50637ed6fab2329d30e31775046588a9/private/net/sockets/winsock2/wsp/msafd/select.c#L59-L655
+    //
+    // And here's an interesting discussion: https://github.com/python-trio/trio/issues/52
+    //
+    // TODO(soon): Implement this with IOCTL_AFD_POLL. For now I'm leaving it unimplemented because
+    //   I added this method for a Linux-only use case.
+    return NEVER_DONE;
   }
 
   void shutdownWrite() override {
@@ -634,31 +640,34 @@ public:
       addrTarget = &result.addr.inet4.sin_addr;
     }
 
-    // addrPart is not necessarily NUL-terminated so we have to make a copy.  :(
     char buffer[64];
-    KJ_REQUIRE(addrPart.size() < sizeof(buffer) - 1, "IP address too long.", addrPart);
-    memcpy(buffer, addrPart.begin(), addrPart.size());
-    buffer[addrPart.size()] = '\0';
+    if (addrPart.size() < sizeof(buffer) - 1) {
+      // addrPart is not necessarily NUL-terminated so we have to make a copy.  :(
+      memcpy(buffer, addrPart.begin(), addrPart.size());
+      buffer[addrPart.size()] = '\0';
 
-    // OK, parse it!
-    switch (InetPtonA(af, buffer, addrTarget)) {
-      case 1: {
-        // success.
-        if (!result.parseAllowedBy(filter)) {
-          KJ_FAIL_REQUIRE("address family blocked by restrictPeers()");
-          return Array<SocketAddress>();
+      // OK, parse it!
+      switch (InetPtonA(af, buffer, addrTarget)) {
+        case 1: {
+          // success.
+          if (!result.parseAllowedBy(filter)) {
+            KJ_FAIL_REQUIRE("address family blocked by restrictPeers()");
+            return Array<SocketAddress>();
+          }
+
+          auto array = kj::heapArrayBuilder<SocketAddress>(1);
+          array.add(result);
+          return array.finish();
         }
-
-        auto array = kj::heapArrayBuilder<SocketAddress>(1);
-        array.add(result);
-        return array.finish();
+        case 0:
+          // It's apparently not a simple address...  fall back to DNS.
+          break;
+        default:
+          KJ_FAIL_WIN32("InetPton", WSAGetLastError(), af, addrPart);
       }
-      case 0:
-        // It's apparently not a simple address...  fall back to DNS.
-        return lookupHost(lowLevel, kj::heapString(addrPart), nullptr, port, filter);
-      default:
-        KJ_FAIL_WIN32("InetPton", WSAGetLastError(), af, addrPart);
     }
+
+    return lookupHost(lowLevel, kj::heapString(addrPart), nullptr, port, filter);
   }
 
   static SocketAddress getLocalAddress(SOCKET sockfd) {
@@ -945,6 +954,11 @@ public:
   void setsockopt(int level, int option, const void* value, uint length) override {
     KJ_WINSOCK(::setsockopt(fd, level, option,
                             reinterpret_cast<const char*>(value), length));
+  }
+  void getsockname(struct sockaddr* addr, uint* length) override {
+    socklen_t socklen = *length;
+    KJ_WINSOCK(::getsockname(fd, addr, &socklen));
+    *length = socklen;
   }
 
 public:

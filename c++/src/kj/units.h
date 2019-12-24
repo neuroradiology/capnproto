@@ -23,15 +23,12 @@
 // time, but should then be optimized down to basic primitives (usually, integers) by the
 // compiler.
 
-#ifndef KJ_UNITS_H_
-#define KJ_UNITS_H_
-
-#if defined(__GNUC__) && !KJ_HEADER_WARNINGS
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "common.h"
 #include <inttypes.h>
+
+KJ_BEGIN_HEADER
 
 namespace kj {
 
@@ -424,6 +421,13 @@ class Absolute {
   //   units, which is actually totally logical and kind of neat.
 
 public:
+  inline constexpr Absolute(MaxValue_): value(maxValue) {}
+  inline constexpr Absolute(MinValue_): value(minValue) {}
+  // Allow initialization from maxValue and minValue.
+  // TODO(msvc): decltype(maxValue) and decltype(minValue) deduce unknown-type for these function
+  // parameters, causing the compiler to complain of a duplicate constructor definition, so we
+  // specify MaxValue_ and MinValue_ types explicitly.
+
   inline constexpr Absolute operator+(const T& other) const { return Absolute(value + other); }
   inline constexpr Absolute operator-(const T& other) const { return Absolute(value - other); }
   inline constexpr T operator-(const Absolute& other) const { return value - other.value; }
@@ -1169,4 +1173,4 @@ inline constexpr Range<Quantity<Bounded<value, uint>, Unit>>
 
 }  // namespace kj
 
-#endif  // KJ_UNITS_H_
+KJ_END_HEADER

@@ -19,18 +19,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef CAPNP_RAW_SCHEMA_H_
-#define CAPNP_RAW_SCHEMA_H_
-
-#if defined(__GNUC__) && !defined(CAPNP_HEADER_WARNINGS)
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "common.h"  // for uint and friends
 
 #if _MSC_VER
 #include <atomic>
 #endif
+
+CAPNP_BEGIN_HEADER
 
 namespace capnp {
 namespace _ {  // private
@@ -239,4 +236,4 @@ inline bool RawBrandedSchema::isUnbound() const {
 }  // namespace _ (private)
 }  // namespace capnp
 
-#endif  // CAPNP_RAW_SCHEMA_H_
+CAPNP_END_HEADER

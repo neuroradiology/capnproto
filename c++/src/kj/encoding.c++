@@ -79,8 +79,23 @@ EncodingResult<Array<T>> encodeUtf(ArrayPtr<const char> text, bool nulTerminate)
       // Disallow overlong sequence.
       GOTO_ERROR_IF(u < 0x0800);
 
-      // Disallow surrogate pair code points.
-      GOTO_ERROR_IF((u & 0xf800) == 0xd800);
+      // Flag surrogate pair code points as errors, but allow them through.
+      if (KJ_UNLIKELY((u & 0xf800) == 0xd800)) {
+        if (result.size() > 0 &&
+            (u & 0xfc00) == 0xdc00 &&
+            (result.back() & 0xfc00) == 0xd800) {
+          // Whoops, the *previous* character was also an invalid surrogate, and if we add this
+          // one too, they'll form a valid surrogate pair. If we allowed this, then it would mean
+          // invalid UTF-8 round-tripped to UTF-16 and back could actually change meaning entirely.
+          // OTOH, the reason we allow dangling surrogates is to allow invalid UTF-16 to round-trip
+          // to UTF-8 without loss, but if the original UTF-16 had a valid surrogate pair, it would
+          // have been encoded as a valid single UTF-8 codepoint, not as separate UTF-8 codepoints
+          // for each surrogate.
+          goto error;
+        }
+
+        hadErrors = true;
+      }
 
       result.add(u);
       continue;
@@ -153,9 +168,12 @@ EncodingResult<String> decodeUtf16(ArrayPtr<const char16_t> utf16) {
     } else if ((u & 0xf800) == 0xd800) {
       // surrogate pair
       char16_t u2;
-      GOTO_ERROR_IF(i == utf16.size()                       // missing second half
-                 || (u & 0x0400) != 0                       // first half in wrong range
-                 || ((u2 = utf16[i]) & 0xfc00) != 0xdc00);  // second half in wrong range
+      if (KJ_UNLIKELY(i == utf16.size()                         // missing second half
+                   || (u & 0x0400) != 0                         // first half in wrong range
+                   || ((u2 = utf16[i]) & 0xfc00) != 0xdc00)) {  // second half in wrong range
+        hadErrors = true;
+        goto threeByte;
+      }
       ++i;
 
       char32_t u32 = (((u & 0x03ff) << 10) | (u2 & 0x03ff)) + 0x10000;
@@ -167,6 +185,7 @@ EncodingResult<String> decodeUtf16(ArrayPtr<const char16_t> utf16) {
       });
       continue;
     } else {
+    threeByte:
       result.addAll<std::initializer_list<char>>({
         static_cast<char>(((u >> 12)       ) | 0xe0),
         static_cast<char>(((u >>  6) & 0x3f) | 0x80),
@@ -174,10 +193,6 @@ EncodingResult<String> decodeUtf16(ArrayPtr<const char16_t> utf16) {
       });
       continue;
     }
-
-  error:
-    result.addAll(StringPtr(u8"\ufffd"));
-    hadErrors = true;
   }
 
   result.add(0);
@@ -202,7 +217,10 @@ EncodingResult<String> decodeUtf32(ArrayPtr<const char32_t> utf16) {
       });
       continue;
     } else if (u < 0x10000) {
-      GOTO_ERROR_IF((u & 0xfffff800) == 0xd800);  // no surrogates allowed in utf-32
+      if (KJ_UNLIKELY((u & 0xfffff800) == 0xd800)) {
+        // no surrogates allowed in utf-32
+        hadErrors = true;
+      }
       result.addAll<std::initializer_list<char>>({
         static_cast<char>(((u >> 12)       ) | 0xe0),
         static_cast<char>(((u >>  6) & 0x3f) | 0x80),
@@ -227,6 +245,96 @@ EncodingResult<String> decodeUtf32(ArrayPtr<const char32_t> utf16) {
 
   result.add(0);
   return { String(result.releaseAsArray()), hadErrors };
+}
+
+namespace {
+
+#if __GNUC__ >= 8 && !__clang__
+// GCC 8's new class-memaccess warning rightly dislikes the following hacks, but we're really sure
+// we want to allow them so disable the warning.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
+
+template <typename To, typename From>
+Array<To> coerceTo(Array<From>&& array) {
+  static_assert(sizeof(To) == sizeof(From), "incompatible coercion");
+  Array<wchar_t> result;
+  memcpy(&result, &array, sizeof(array));
+  memset(&array, 0, sizeof(array));
+  return result;
+}
+
+template <typename To, typename From>
+ArrayPtr<To> coerceTo(ArrayPtr<From> array) {
+  static_assert(sizeof(To) == sizeof(From), "incompatible coercion");
+  return arrayPtr(reinterpret_cast<To*>(array.begin()), array.size());
+}
+
+template <typename To, typename From>
+EncodingResult<Array<To>> coerceTo(EncodingResult<Array<From>>&& result) {
+  return { coerceTo<To>(Array<From>(kj::mv(result))), result.hadErrors };
+}
+
+#if __GNUC__ >= 8 && !__clang__
+#pragma GCC diagnostic pop
+#endif
+
+template <size_t s>
+struct WideConverter;
+
+template <>
+struct WideConverter<sizeof(char)> {
+  typedef char Type;
+
+  static EncodingResult<Array<char>> encode(ArrayPtr<const char> text, bool nulTerminate) {
+    auto result = heapArray<char>(text.size() + nulTerminate);
+    memcpy(result.begin(), text.begin(), text.size());
+    if (nulTerminate) result.back() = 0;
+    return { kj::mv(result), false };
+  }
+
+  static EncodingResult<kj::String> decode(ArrayPtr<const char> text) {
+    return { kj::heapString(text), false };
+  }
+};
+
+template <>
+struct WideConverter<sizeof(char16_t)> {
+  typedef char16_t Type;
+
+  static inline EncodingResult<Array<char16_t>> encode(
+      ArrayPtr<const char> text, bool nulTerminate) {
+    return encodeUtf16(text, nulTerminate);
+  }
+
+  static inline EncodingResult<kj::String> decode(ArrayPtr<const char16_t> text) {
+    return decodeUtf16(text);
+  }
+};
+
+template <>
+struct WideConverter<sizeof(char32_t)> {
+  typedef char32_t Type;
+
+  static inline EncodingResult<Array<char32_t>> encode(
+      ArrayPtr<const char> text, bool nulTerminate) {
+    return encodeUtf32(text, nulTerminate);
+  }
+
+  static inline EncodingResult<kj::String> decode(ArrayPtr<const char32_t> text) {
+    return decodeUtf32(text);
+  }
+};
+
+}  // namespace
+
+EncodingResult<Array<wchar_t>> encodeWideString(ArrayPtr<const char> text, bool nulTerminate) {
+  return coerceTo<wchar_t>(WideConverter<sizeof(wchar_t)>::encode(text, nulTerminate));
+}
+EncodingResult<String> decodeWideString(ArrayPtr<const wchar_t> wide) {
+  using Converter = WideConverter<sizeof(wchar_t)>;
+  return Converter::decode(coerceTo<const Converter::Type>(wide));
 }
 
 // =======================================================================================
@@ -293,7 +401,9 @@ EncodingResult<Array<byte>> decodeHex(ArrayPtr<const char> text) {
 String encodeUriComponent(ArrayPtr<const byte> bytes) {
   Vector<char> result(bytes.size() + 1);
   for (byte b: bytes) {
-    if (('A' <= b && b <= 'Z') || ('a' <= b && b <= 'z') || ('0' <= b && b <= '9') ||
+    if (('A' <= b && b <= 'Z') ||
+        ('a' <= b && b <= 'z') ||
+        ('0' <= b && b <= '9') ||
         b == '-' || b == '_' || b == '.' || b == '!' || b == '~' || b == '*' || b == '\'' ||
         b == '(' || b == ')') {
       result.add(b);
@@ -307,9 +417,86 @@ String encodeUriComponent(ArrayPtr<const byte> bytes) {
   return String(result.releaseAsArray());
 }
 
+String encodeUriFragment(ArrayPtr<const byte> bytes) {
+  Vector<char> result(bytes.size() + 1);
+  for (byte b: bytes) {
+    if (('?' <= b && b <= '_') || // covers A-Z
+        ('a' <= b && b <= '~') || // covers a-z
+        ('&' <= b && b <= ';') || // covers 0-9
+        b == '!' || b == '=' || b == '#' || b == '$') {
+      result.add(b);
+    } else {
+      result.add('%');
+      result.add(HEX_DIGITS_URI[b/16]);
+      result.add(HEX_DIGITS_URI[b%16]);
+    }
+  }
+  result.add('\0');
+  return String(result.releaseAsArray());
+}
+
+String encodeUriPath(ArrayPtr<const byte> bytes) {
+  Vector<char> result(bytes.size() + 1);
+  for (byte b: bytes) {
+    if (('@' <= b && b <= '[') || // covers A-Z
+        ('a' <= b && b <= 'z') ||
+        ('0' <= b && b <= ';') || // covers 0-9
+        ('&' <= b && b <= '.') ||
+        b == '_' || b == '!' || b == '=' || b == ']' ||
+        b == '^' || b == '|' || b == '~' || b == '$') {
+      result.add(b);
+    } else {
+      result.add('%');
+      result.add(HEX_DIGITS_URI[b/16]);
+      result.add(HEX_DIGITS_URI[b%16]);
+    }
+  }
+  result.add('\0');
+  return String(result.releaseAsArray());
+}
+
+String encodeUriUserInfo(ArrayPtr<const byte> bytes) {
+  Vector<char> result(bytes.size() + 1);
+  for (byte b: bytes) {
+    if (('A' <= b && b <= 'Z') ||
+        ('a' <= b && b <= 'z') ||
+        ('0' <= b && b <= '9') ||
+        ('&' <= b && b <= '.') ||
+        b == '_' || b == '!' || b == '~' || b == '$') {
+      result.add(b);
+    } else {
+      result.add('%');
+      result.add(HEX_DIGITS_URI[b/16]);
+      result.add(HEX_DIGITS_URI[b%16]);
+    }
+  }
+  result.add('\0');
+  return String(result.releaseAsArray());
+}
+
+String encodeWwwForm(ArrayPtr<const byte> bytes) {
+  Vector<char> result(bytes.size() + 1);
+  for (byte b: bytes) {
+    if (('A' <= b && b <= 'Z') ||
+        ('a' <= b && b <= 'z') ||
+        ('0' <= b && b <= '9') ||
+        b == '-' || b == '_' || b == '.' || b == '*') {
+      result.add(b);
+    } else if (b == ' ') {
+      result.add('+');
+    } else {
+      result.add('%');
+      result.add(HEX_DIGITS_URI[b/16]);
+      result.add(HEX_DIGITS_URI[b%16]);
+    }
+  }
+  result.add('\0');
+  return String(result.releaseAsArray());
+}
+
 EncodingResult<Array<byte>> decodeBinaryUriComponent(
-    ArrayPtr<const char> text, bool nulTerminate) {
-  Vector<byte> result(text.size() + nulTerminate);
+    ArrayPtr<const char> text, DecodeUriOptions options) {
+  Vector<byte> result(text.size() + options.nulTerminate);
   bool hadErrors = false;
 
   const char* ptr = text.begin();
@@ -335,12 +522,15 @@ EncodingResult<Array<byte>> decodeBinaryUriComponent(
       } else {
         hadErrors = true;
       }
+    } else if (options.plusToSpace && *ptr == '+') {
+      ++ptr;
+      result.add(' ');
     } else {
       result.add(*ptr++);
     }
   }
 
-  if (nulTerminate) result.add(0);
+  if (options.nulTerminate) result.add(0);
   return { result.releaseAsArray(), hadErrors };
 }
 
@@ -549,6 +739,7 @@ int base64_encode_block(const char* plaintext_in, int length_in,
       result = (fragment & 0x0fc) >> 2;
       *codechar++ = base64_encode_value(result);
       result = (fragment & 0x003) << 4;
+      // fallthrough
   case step_B:
       if (plainchar == plaintextend) {
         state_in->result = result;
@@ -559,6 +750,7 @@ int base64_encode_block(const char* plaintext_in, int length_in,
       result |= (fragment & 0x0f0) >> 4;
       *codechar++ = base64_encode_value(result);
       result = (fragment & 0x00f) << 2;
+      // fallthrough
   case step_C:
       if (plainchar == plaintextend) {
         state_in->result = result;
@@ -677,7 +869,7 @@ int base64_decode_value(char value_in) {
   // Note that the original libb64 implementation used -1 for invalid input, -2 on padding -- this
   // new scheme allows for some simpler error checks in steps A and B.
 
-  static const char decoding[] = {
+  static const signed char decoding[] = {
     -3,-3,-3,-3,-3,-3,-3,-3,  -3,-1,-1,-3,-1,-1,-3,-3,
     -3,-3,-3,-3,-3,-3,-3,-3,  -3,-3,-3,-3,-3,-3,-3,-3,
     -1,-3,-3,-3,-3,-3,-3,-3,  -3,-3,-3,62,-3,-3,-3,63,
@@ -704,7 +896,7 @@ int base64_decode_block(const char* code_in, const int length_in,
                         char* plaintext_out, base64_decodestate* state_in) {
   const char* codechar = code_in;
   char* plainchar = plaintext_out;
-  char fragment;
+  signed char fragment;
 
   if (state_in->step != step_a) {
     *plainchar = state_in->plainchar;
@@ -723,11 +915,12 @@ int base64_decode_block(const char* code_in, const int length_in,
           state_in->plainchar = '\0';
           return plainchar - plaintext_out;
         }
-        fragment = (char)base64_decode_value(*codechar++);
+        fragment = (signed char)base64_decode_value(*codechar++);
         // It is an error to see invalid or padding bytes in step A.
         ERROR_IF(fragment < -1);
       } while (fragment < 0);
       *plainchar    = (fragment & 0x03f) << 2;
+      // fallthrough
   case step_b:
       do {
         if (codechar == code_in+length_in) {
@@ -739,12 +932,13 @@ int base64_decode_block(const char* code_in, const int length_in,
           state_in->hadErrors = true;
           return plainchar - plaintext_out;
         }
-        fragment = (char)base64_decode_value(*codechar++);
+        fragment = (signed char)base64_decode_value(*codechar++);
         // It is an error to see invalid or padding bytes in step B.
         ERROR_IF(fragment < -1);
       } while (fragment < 0);
       *plainchar++ |= (fragment & 0x030) >> 4;
       *plainchar    = (fragment & 0x00f) << 4;
+      // fallthrough
   case step_c:
       do {
         if (codechar == code_in+length_in) {
@@ -756,7 +950,7 @@ int base64_decode_block(const char* code_in, const int length_in,
           ERROR_IF(state_in->nPaddingBytesSeen == 1);
           return plainchar - plaintext_out;
         }
-        fragment = (char)base64_decode_value(*codechar++);
+        fragment = (signed char)base64_decode_value(*codechar++);
         // It is an error to see invalid bytes or more than two padding bytes in step C.
         ERROR_IF(fragment < -2 || (fragment == -2 && ++state_in->nPaddingBytesSeen > 2));
       } while (fragment < 0);
@@ -764,6 +958,7 @@ int base64_decode_block(const char* code_in, const int length_in,
       ERROR_IF(state_in->nPaddingBytesSeen > 0);
       *plainchar++ |= (fragment & 0x03c) >> 2;
       *plainchar    = (fragment & 0x003) << 6;
+      // fallthrough
   case step_d:
       do {
         if (codechar == code_in+length_in) {
@@ -771,7 +966,7 @@ int base64_decode_block(const char* code_in, const int length_in,
           state_in->plainchar = *plainchar;
           return plainchar - plaintext_out;
         }
-        fragment = (char)base64_decode_value(*codechar++);
+        fragment = (signed char)base64_decode_value(*codechar++);
         // It is an error to see invalid bytes or more than one padding byte in step D.
         ERROR_IF(fragment < -2 || (fragment == -2 && ++state_in->nPaddingBytesSeen > 1));
       } while (fragment < 0);
@@ -804,6 +999,26 @@ EncodingResult<Array<byte>> decodeBase64(ArrayPtr<const char> input) {
   }
 
   return EncodingResult<Array<byte>>(kj::mv(output), state.hadErrors);
+}
+
+String encodeBase64Url(ArrayPtr<const byte> bytes) {
+  // TODO(perf): Rewrite as single pass?
+  // TODO(someday): Write decoder?
+
+  auto base64 = kj::encodeBase64(bytes);
+
+  for (char& c: base64) {
+    if (c == '+') c = '-';
+    if (c == '/') c = '_';
+  }
+
+  // Remove trailing '='s.
+  kj::ArrayPtr<const char> slice = base64;
+  while (slice.size() > 0 && slice.back() == '=') {
+    slice = slice.slice(0, slice.size() - 1);
+  }
+
+  return kj::str(slice);
 }
 
 } // namespace kj

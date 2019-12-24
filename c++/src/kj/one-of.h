@@ -19,14 +19,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_ONE_OF_H_
-#define KJ_ONE_OF_H_
-
-#if defined(__GNUC__) && !KJ_HEADER_WARNINGS
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "common.h"
+
+KJ_BEGIN_HEADER
 
 namespace kj {
 
@@ -115,6 +112,14 @@ public:
   Maybe<T&> tryGet() {
     if (is<T>()) {
       return *reinterpret_cast<T*>(space);
+    } else {
+      return nullptr;
+    }
+  }
+  template <typename T>
+  Maybe<const T&> tryGet() const {
+    if (is<T>()) {
+      return *reinterpret_cast<const T*>(space);
     } else {
       return nullptr;
     }
@@ -238,17 +243,17 @@ void OneOf<Variants...>::allHandled() {
 
 #if __cplusplus > 201402L
 #define KJ_SWITCH_ONEOF(value) \
-  switch (auto _kj_switch_subject = value._switchSubject(); _kj_switch_subject->which())
+  switch (auto _kj_switch_subject = (value)._switchSubject(); _kj_switch_subject->which())
 #else
 #define KJ_SWITCH_ONEOF(value) \
   /* Without C++17, we can only support one switch per containing block. Deal with it. */ \
-  auto _kj_switch_subject = value._switchSubject(); \
+  auto _kj_switch_subject = (value)._switchSubject(); \
   switch (_kj_switch_subject->which())
 #endif
 #define KJ_CASE_ONEOF(name, ...) \
     break; \
-  case ::kj::Decay<decltype(*_kj_switch_subject)>::tagFor<__VA_ARGS__>(): \
-    for (auto& name = _kj_switch_subject->get<__VA_ARGS__>(), *_kj_switch_done = &name; \
+  case ::kj::Decay<decltype(*_kj_switch_subject)>::template tagFor<__VA_ARGS__>(): \
+    for (auto& name = _kj_switch_subject->template get<__VA_ARGS__>(), *_kj_switch_done = &name; \
          _kj_switch_done; _kj_switch_done = nullptr)
 #define KJ_CASE_ONEOF_DEFAULT break; default:
 // Allows switching over a OneOf.
@@ -285,4 +290,4 @@ void OneOf<Variants...>::allHandled() {
 
 }  // namespace kj
 
-#endif  // KJ_ONE_OF_H_
+KJ_END_HEADER

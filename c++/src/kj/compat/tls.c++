@@ -30,6 +30,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/evp.h>
 #include <openssl/conf.h>
+#include <openssl/ssl.h>
 #include <openssl/tls1.h>
 #include <kj/debug.h>
 #include <kj/vector.h>
@@ -74,6 +75,7 @@ void X509_up_ref(X509* x509) {
 
 #endif
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 class OpenSslInit {
   // Initializes the OpenSSL library.
 public:
@@ -88,6 +90,11 @@ void ensureOpenSslInitialized() {
   // Initializes the OpenSSL library the first time it is called.
   static OpenSslInit init;
 }
+#else
+inline void ensureOpenSslInitialized() {
+  // As of 1.1.0, no initialization is needed.
+}
+#endif
 
 // =======================================================================================
 // Implementation of kj::AsyncIoStream that applies TLS on top of some other AsyncIoStream.
@@ -98,7 +105,7 @@ void ensureOpenSslInitialized() {
 //   AsyncIoStream is simply wrapping a file descriptor (or other readiness-based stream?) and use
 //   that directly if so.
 
-class TlsConnection: public kj::AsyncIoStream {
+class TlsConnection final: public kj::AsyncIoStream {
 public:
   TlsConnection(kj::Own<kj::AsyncIoStream> stream, SSL_CTX* ctx)
       : TlsConnection(*stream, ctx) {
@@ -173,10 +180,14 @@ public:
     return writeInternal(pieces[0], pieces.slice(1, pieces.size()));
   }
 
+  Promise<void> whenWriteDisconnected() override {
+    return inner.whenWriteDisconnected();
+  }
+
   void shutdownWrite() override {
     KJ_REQUIRE(shutdownTask == nullptr, "already called shutdownWrite()");
 
-    // TODO(soon): shutdownWrite() is problematic because it doesn't return a promise. It was
+    // TODO(0.8): shutdownWrite() is problematic because it doesn't return a promise. It was
     //   designed to assume that it would only be called after all writes are finished and that
     //   there was no reason to block at that point, but SSL sessions don't fit this since they
     //   actually have to send a shutdown message.
@@ -224,7 +235,7 @@ private:
 
     return sslCall([this,buffer,maxBytes]() { return SSL_read(ssl, buffer, maxBytes); })
         .then([this,buffer,minBytes,maxBytes,alreadyDone](size_t n) -> kj::Promise<size_t> {
-      if (n >= minBytes) {
+      if (n >= minBytes || n == 0) {
         return alreadyDone + n;
       } else {
         return tryReadInternal(reinterpret_cast<byte*>(buffer) + n,
@@ -239,7 +250,9 @@ private:
 
     return sslCall([this,first]() { return SSL_write(ssl, first.begin(), first.size()); })
         .then([this,first,rest](size_t n) -> kj::Promise<void> {
-      if (n < first.size()) {
+      if (n == 0) {
+        return KJ_EXCEPTION(DISCONNECTED, "ssl connection ended during write");
+      } else if (n < first.size()) {
         return writeInternal(first.slice(n, first.size()), rest);
       } else if (rest.size() > 0) {
         return writeInternal(rest[0], rest.slice(1, rest.size()));
@@ -369,7 +382,7 @@ private:
 // =======================================================================================
 // Implementations of ConnectionReceiver, NetworkAddress, and Network as wrappers adding TLS.
 
-class TlsConnectionReceiver: public kj::ConnectionReceiver {
+class TlsConnectionReceiver final: public kj::ConnectionReceiver {
 public:
   TlsConnectionReceiver(TlsContext& tls, kj::Own<kj::ConnectionReceiver> inner)
       : tls(tls), inner(kj::mv(inner)) {}
@@ -397,7 +410,7 @@ private:
   kj::Own<kj::ConnectionReceiver> inner;
 };
 
-class TlsNetworkAddress: public kj::NetworkAddress {
+class TlsNetworkAddress final: public kj::NetworkAddress {
 public:
   TlsNetworkAddress(TlsContext& tls, kj::String hostname, kj::Own<kj::NetworkAddress>&& inner)
       : tls(tls), hostname(kj::mv(hostname)), inner(kj::mv(inner)) {}
@@ -432,7 +445,7 @@ private:
   kj::Own<kj::NetworkAddress> inner;
 };
 
-class TlsNetwork: public kj::Network {
+class TlsNetwork final: public kj::Network {
 public:
   TlsNetwork(TlsContext& tls, kj::Network& inner): tls(tls), inner(inner) {}
   TlsNetwork(TlsContext& tls, kj::Own<kj::Network> inner)
@@ -488,6 +501,13 @@ TlsContext::Options::Options()
 //
 // Classic DH is arguably obsolete and will only become more so as time passes, so perhaps we'll
 // never bother.
+
+struct TlsContext::SniCallback {
+  // struct SniCallback exists only so that callback() can be declared in the .c++ file, since it
+  // references OpenSSL types.
+
+  static int callback(SSL* ssl, int* ad, void* arg);
+};
 
 TlsContext::TlsContext(Options options) {
   ensureOpenSslInitialized();
@@ -573,21 +593,17 @@ TlsContext::TlsContext(Options options) {
 
   // honor options.sniCallback
   KJ_IF_MAYBE(sni, options.sniCallback) {
-    SSL_CTX_set_tlsext_servername_callback(ctx, &sniCallback);
+    SSL_CTX_set_tlsext_servername_callback(ctx, &SniCallback::callback);
     SSL_CTX_set_tlsext_servername_arg(ctx, sni);
   }
 
   this->ctx = ctx;
 }
 
-int TlsContext::sniCallback(void* sslp, int* ad, void* arg) {
-  // The first parameter is actually type SSL*, but we didn't want to include the OpenSSL headers
-  // from our header.
-  //
+int TlsContext::SniCallback::callback(SSL* ssl, int* ad, void* arg) {
   // The third parameter is actually type TlsSniCallback*.
 
   KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
-    SSL* ssl = reinterpret_cast<SSL*>(sslp);
     TlsSniCallback& sni = *reinterpret_cast<TlsSniCallback*>(arg);
 
     const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
@@ -671,14 +687,14 @@ TlsPrivateKey::TlsPrivateKey(kj::ArrayPtr<const byte> asn1) {
   }
 }
 
-TlsPrivateKey::TlsPrivateKey(kj::StringPtr pem) {
+TlsPrivateKey::TlsPrivateKey(kj::StringPtr pem, kj::Maybe<kj::StringPtr> password) {
   ensureOpenSslInitialized();
 
   // const_cast apparently needed for older versions of OpenSSL.
   BIO* bio = BIO_new_mem_buf(const_cast<char*>(pem.begin()), pem.size());
   KJ_DEFER(BIO_free(bio));
 
-  pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+  pkey = PEM_read_bio_PrivateKey(bio, nullptr, &passwordCallback, &password);
   if (pkey == nullptr) {
     throwOpensslError();
   }
@@ -700,6 +716,18 @@ TlsPrivateKey& TlsPrivateKey::operator=(const TlsPrivateKey& other) {
 
 TlsPrivateKey::~TlsPrivateKey() noexcept(false) {
   EVP_PKEY_free(reinterpret_cast<EVP_PKEY*>(pkey));
+}
+
+int TlsPrivateKey::passwordCallback(char* buf, int size, int rwflag, void* u) {
+  auto& password = *reinterpret_cast<kj::Maybe<kj::StringPtr>*>(u);
+
+  KJ_IF_MAYBE(p, password) {
+    int result = kj::min(p->size(), size);
+    memcpy(buf, p->begin(), result);
+    return result;
+  } else {
+    return 0;
+  }
 }
 
 // =======================================================================================

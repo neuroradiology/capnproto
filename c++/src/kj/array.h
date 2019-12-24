@@ -19,16 +19,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_ARRAY_H_
-#define KJ_ARRAY_H_
+#pragma once
 
-#if defined(__GNUC__) && !KJ_HEADER_WARNINGS
-#pragma GCC system_header
-#endif
-
-#include "common.h"
+#include "memory.h"
 #include <string.h>
 #include <initializer_list>
+
+KJ_BEGIN_HEADER
 
 namespace kj {
 
@@ -163,7 +160,11 @@ public:
   }
 
   inline size_t size() const { return size_; }
-  inline T& operator[](size_t index) const {
+  inline T& operator[](size_t index) {
+    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
+    return ptr[index];
+  }
+  inline const T& operator[](size_t index) const {
     KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
     return ptr[index];
   }
@@ -234,6 +235,10 @@ public:
     other.size_ = 0;
     return *this;
   }
+
+  template <typename... Attachments>
+  Array<T> attach(Attachments&&... attachments) KJ_WARN_UNUSED_RESULT;
+  // Like Own<T>::attach(), but attaches to an Array.
 
 private:
   T* ptr;
@@ -353,7 +358,11 @@ public:
 
   inline size_t size() const { return pos - ptr; }
   inline size_t capacity() const { return endPtr - ptr; }
-  inline T& operator[](size_t index) const {
+  inline T& operator[](size_t index) {
+    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr), "Out-of-bounds Array access.");
+    return ptr[index];
+  }
+  inline const T& operator[](size_t index) const {
     KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr), "Out-of-bounds Array access.");
     return ptr[index];
   }
@@ -417,6 +426,16 @@ public:
     }
   }
 
+  void clear() {
+    if (__has_trivial_destructor(T)) {
+      pos = ptr;
+    } else {
+      while (pos > ptr) {
+        kj::dtor(*--pos);
+      }
+    }
+  }
+
   void resize(size_t size) {
     KJ_IREQUIRE(size <= capacity(), "can't resize past capacity");
 
@@ -444,7 +463,7 @@ public:
 
   Array<T> finish() {
     // We could safely remove this check if we assume that the disposer implementation doesn't
-    // need to know the original capacity, as is thes case with HeapArrayDisposer since it uses
+    // need to know the original capacity, as is the case with HeapArrayDisposer since it uses
     // operator new() or if we created a custom disposer for ArrayBuilder which stores the capacity
     // in a prefix.  But that would make it hard to write cleverer heap allocators, and anyway this
     // check might catch bugs.  Probably people should use Vector if they want to build arrays
@@ -618,7 +637,8 @@ struct ArrayDisposer::Dispose_<T, false> {
 
   static void dispose(T* firstElement, size_t elementCount, size_t capacity,
                       const ArrayDisposer& disposer) {
-    disposer.disposeImpl(firstElement, sizeof(T), elementCount, capacity, &destruct);
+    disposer.disposeImpl(const_cast<RemoveConst<T>*>(firstElement),
+                         sizeof(T), elementCount, capacity, &destruct);
   }
 };
 
@@ -835,6 +855,51 @@ inline Array<Decay<T>> arr(T&& param1, Params&&... params) {
 }
 #endif
 
+namespace _ {  // private
+
+template <typename... T>
+struct ArrayDisposableOwnedBundle final: public ArrayDisposer, public OwnedBundle<T...> {
+  ArrayDisposableOwnedBundle(T&&... values): OwnedBundle<T...>(kj::fwd<T>(values)...) {}
+  void disposeImpl(void*, size_t, size_t, size_t, void (*)(void*)) const override { delete this; }
+};
+
+}  // namespace _ (private)
+
+template <typename T>
+template <typename... Attachments>
+Array<T> Array<T>::attach(Attachments&&... attachments) {
+  T* ptrCopy = ptr;
+  auto sizeCopy = size_;
+
+  KJ_IREQUIRE(ptrCopy != nullptr, "cannot attach to null pointer");
+
+  // HACK: If someone accidentally calls .attach() on a null pointer in opt mode, try our best to
+  //   accomplish reasonable behavior: We turn the pointer non-null but still invalid, so that the
+  //   disposer will still be called when the pointer goes out of scope.
+  if (ptrCopy == nullptr) ptrCopy = reinterpret_cast<T*>(1);
+
+  auto bundle = new _::ArrayDisposableOwnedBundle<Array<T>, Attachments...>(
+      kj::mv(*this), kj::fwd<Attachments>(attachments)...);
+  return Array<T>(ptrCopy, sizeCopy, *bundle);
+}
+
+template <typename T>
+template <typename... Attachments>
+Array<T> ArrayPtr<T>::attach(Attachments&&... attachments) const {
+  T* ptrCopy = ptr;
+
+  KJ_IREQUIRE(ptrCopy != nullptr, "cannot attach to null pointer");
+
+  // HACK: If someone accidentally calls .attach() on a null pointer in opt mode, try our best to
+  //   accomplish reasonable behavior: We turn the pointer non-null but still invalid, so that the
+  //   disposer will still be called when the pointer goes out of scope.
+  if (ptrCopy == nullptr) ptrCopy = reinterpret_cast<T*>(1);
+
+  auto bundle = new _::ArrayDisposableOwnedBundle<Attachments...>(
+      kj::fwd<Attachments>(attachments)...);
+  return Array<T>(ptrCopy, size_, *bundle);
+}
+
 }  // namespace kj
 
-#endif  // KJ_ARRAY_H_
+KJ_END_HEADER

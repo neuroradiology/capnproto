@@ -19,15 +19,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_ASYNC_WIN32_H_
-#define KJ_ASYNC_WIN32_H_
+#pragma once
 
 #if !_WIN32
 #error "This file is Windows-specific. On Unix, include async-unix.h instead."
 #endif
 
 #include "async.h"
-#include "time.h"
+#include "timer.h"
 #include "io.h"
 #include <atomic>
 #include <inttypes.h>
@@ -210,14 +209,14 @@ private:
   class IoOperationImpl;
   class IoObserverImpl;
 
+  const MonotonicClock& clock;
+
   AutoCloseHandle iocp;
   AutoCloseHandle thread;
   Win32WaitObjectThreadPool waitThreads;
   TimerImpl timerImpl;
   mutable std::atomic<bool> sentWake {false};
   bool isAllowApc = false;
-
-  static TimePoint readClock();
 
   void waitIocp(DWORD timeoutMs);
   // Wait on the I/O completion port for up to timeoutMs and pump events. Does not advance the
@@ -230,5 +229,3 @@ private:
 };
 
 } // namespace kj
-
-#endif // KJ_ASYNC_WIN32_H_

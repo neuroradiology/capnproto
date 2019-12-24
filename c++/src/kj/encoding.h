@@ -19,19 +19,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_ENCODING_H_
-#define KJ_ENCODING_H_
+#pragma once
 // Functions for encoding/decoding bytes and text in common formats, including:
 // - UTF-{8,16,32}
 // - Hex
 // - URI encoding
 // - Base64
 
-#if defined(__GNUC__) && !KJ_HEADER_WARNINGS
-#pragma GCC system_header
-#endif
-
 #include "string.h"
+
+KJ_BEGIN_HEADER
 
 namespace kj {
 
@@ -52,17 +49,24 @@ struct EncodingResult: public ResultType {
   const bool hadErrors;
 };
 
+template <typename T>
+inline auto KJ_STRINGIFY(const EncodingResult<T>& value)
+    -> decltype(toCharSequence(implicitCast<const T&>(value))) {
+  return toCharSequence(implicitCast<const T&>(value));
+}
+
 EncodingResult<Array<char16_t>> encodeUtf16(ArrayPtr<const char> text, bool nulTerminate = false);
 EncodingResult<Array<char32_t>> encodeUtf32(ArrayPtr<const char> text, bool nulTerminate = false);
 // Convert UTF-8 text (which KJ strings use) to UTF-16 or UTF-32.
 //
 // If `nulTerminate` is true, an extra NUL character will be added to the end of the output.
 //
-// The `try` versions return null if the input is invalid; the non-`try` versions return data
-// containing the Unicode replacement character (U+FFFD).
-//
 // The returned arrays are in platform-native endianness (otherwise they wouldn't really be
 // char16_t / char32_t).
+//
+// Note that the KJ Unicode encoding and decoding functions actually implement
+// [WTF-8 encoding](http://simonsapin.github.io/wtf-8/), which affects how invalid input is
+// handled. See comments on decodeUtf16() for more info.
 
 EncodingResult<String> decodeUtf16(ArrayPtr<const char16_t> utf16);
 EncodingResult<String> decodeUtf32(ArrayPtr<const char32_t> utf32);
@@ -71,10 +75,46 @@ EncodingResult<String> decodeUtf32(ArrayPtr<const char32_t> utf32);
 // The input should NOT include a NUL terminator; any NUL characters in the input array will be
 // preserved in the output.
 //
-// The `try` versions return null if the input is invalid; the non-`try` versions return data
-// containing the Unicode replacement character (U+FFFD).
-//
 // The input must be in platform-native endianness. BOMs are NOT recognized by these functions.
+//
+// Note that the KJ Unicode encoding and decoding functions actually implement
+// [WTF-8 encoding](http://simonsapin.github.io/wtf-8/). This means that if you start with an array
+// of char16_t and you pass it through any number of conversions to other Unicode encodings,
+// eventually returning it to UTF-16, all the while ignoring `hadErrors`, you will end up with
+// exactly the same char16_t array you started with, *even if* the array is not valid UTF-16. This
+// is useful because many real-world systems that were designed for UCS-2 (plain 16-bit Unicode)
+// and later "upgraded" to UTF-16 do not enforce that their UTF-16 is well-formed. For example,
+// file names on Windows NT are encoded using 16-bit characters, without enforcing that the
+// character sequence is valid UTF-16. It is important that programs on Windows be able to handle
+// such filenames, even if they choose to convert the name to UTF-8 for internal processing.
+//
+// Specifically, KJ's Unicode handling allows unpaired surrogate code points to round-trip through
+// UTF-8 and UTF-32. Unpaired surrogates will be flagged as an error (setting `hadErrors` in the
+// result), but will NOT be replaced with the Unicode replacement character as other erroneous
+// sequences would be, but rather encoded as an invalid surrogate codepoint in the target encoding.
+//
+// KJ makes the following guarantees about invalid input:
+// - A round trip from UTF-16 to other encodings and back will produce exactly the original input,
+//   with every leg of the trip raising the `hadErrors` flag if the original input was not valid.
+// - A round trip from UTF-8 or UTF-32 to other encodings and back will either produce exactly
+//   the original input, or will have replaced some invalid sequences with the Unicode replacement
+//   character, U+FFFD. No code units will ever be removed unless they are replaced with U+FFFD,
+//   and no code units will ever be added except to encode U+FFFD. If the original input was not
+//   valid, the `hadErrors` flag will be raised on the first leg of the trip, and will also be
+//   raised on subsequent legs unless all invalid sequences were replaced with U+FFFD (which, after
+//   all, is a valid code point).
+
+EncodingResult<Array<wchar_t>> encodeWideString(
+    ArrayPtr<const char> text, bool nulTerminate = false);
+EncodingResult<String> decodeWideString(ArrayPtr<const wchar_t> wide);
+// Encode / decode strings of wchar_t, aka "wide strings". Unfortunately, different platforms have
+// different definitions for wchar_t. For example, on Windows they are 16-bit and encode UTF-16,
+// but on Linux they are 32-bit and encode UTF-32. Some platforms even define wchar_t as 8-bit,
+// encoding UTF-8 (e.g. BeOS did this).
+//
+// KJ assumes that wide strings use the UTF encoding that corresponds to the size of wchar_t on
+// the target platform. So, these functions are simple aliases for encodeUtf*/decodeUtf*, above
+// (or simply make a copy if wchar_t is 8 bits).
 
 String encodeHex(ArrayPtr<const byte> bytes);
 EncodingResult<Array<byte>> decodeHex(ArrayPtr<const char> text);
@@ -82,10 +122,80 @@ EncodingResult<Array<byte>> decodeHex(ArrayPtr<const char> text);
 
 String encodeUriComponent(ArrayPtr<const byte> bytes);
 String encodeUriComponent(ArrayPtr<const char> bytes);
-EncodingResult<Array<byte>> decodeBinaryUriComponent(
-    ArrayPtr<const char> text, bool nulTerminate = false);
 EncodingResult<String> decodeUriComponent(ArrayPtr<const char> text);
-// Encode/decode URI components using % escapes. See Javascript's encodeURIComponent().
+// Encode/decode URI components using % escapes for characters listed as "reserved" in RFC 2396.
+// This is the same behavior as JavaScript's `encodeURIComponent()`.
+//
+// See https://tools.ietf.org/html/rfc2396#section-2.3
+
+String encodeUriFragment(ArrayPtr<const byte> bytes);
+String encodeUriFragment(ArrayPtr<const char> bytes);
+// Encode URL fragment components using the fragment percent encode set defined by the WHATWG URL
+// specification. Use decodeUriComponent() to decode.
+//
+// Quirk: We also percent-encode the '%' sign itself, because we expect to be called on percent-
+//   decoded data. In other words, this function is not idempotent, in contrast to the URL spec.
+//
+// See https://url.spec.whatwg.org/#fragment-percent-encode-set
+
+String encodeUriPath(ArrayPtr<const byte> bytes);
+String encodeUriPath(ArrayPtr<const char> bytes);
+// Encode URL path components (not entire paths!) using the path percent encode set defined by the
+// WHATWG URL specification. Use decodeUriComponent() to decode.
+//
+// Quirk: We also percent-encode the '%' sign itself, because we expect to be called on percent-
+//   decoded data. In other words, this function is not idempotent, in contrast to the URL spec.
+//
+// Quirk: This percent-encodes '/' and '\' characters as well, which are not actually in the set
+//   defined by the WHATWG URL spec. Since a conforming URL implementation will only ever call this
+//   function on individual path components, and never entire paths, augmenting the character set to
+//   include these separators allows this function to be used to implement a URL class that stores
+//   its path components in percent-decoded form.
+//
+// See https://url.spec.whatwg.org/#path-percent-encode-set
+
+String encodeUriUserInfo(ArrayPtr<const byte> bytes);
+String encodeUriUserInfo(ArrayPtr<const char> bytes);
+// Encode URL userinfo components using the userinfo percent encode set defined by the WHATWG URL
+// specification. Use decodeUriComponent() to decode.
+//
+// Quirk: We also percent-encode the '%' sign itself, because we expect to be called on percent-
+//   decoded data. In other words, this function is not idempotent, in contrast to the URL spec.
+//
+// See https://url.spec.whatwg.org/#userinfo-percent-encode-set
+
+String encodeWwwForm(ArrayPtr<const byte> bytes);
+String encodeWwwForm(ArrayPtr<const char> bytes);
+EncodingResult<String> decodeWwwForm(ArrayPtr<const char> text);
+// Encode/decode URI components using % escapes and '+' (for spaces) according to the
+// application/x-www-form-urlencoded format defined by the WHATWG URL specification.
+//
+// Note: Like the fragment, path, and userinfo percent-encoding functions above, this function is
+//   not idempotent: we percent-encode '%' signs. However, in this particular case the spec happens
+//   to agree with us!
+//
+// See https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer
+
+struct DecodeUriOptions {
+  // Parameter to `decodeBinaryUriComponent()`.
+
+  // This struct is intentionally convertible from bool, in order to maintain backwards
+  // compatibility with code written when `decodeBinaryUriComponent()` took a boolean second
+  // parameter.
+  DecodeUriOptions(bool nulTerminate = false, bool plusToSpace = false)
+      : nulTerminate(nulTerminate), plusToSpace(plusToSpace) {}
+
+  bool nulTerminate;
+  // Append a terminal NUL byte.
+
+  bool plusToSpace;
+  // Convert '+' to ' ' characters before percent decoding. Used to decode
+  // application/x-www-form-urlencoded text, such as query strings.
+};
+EncodingResult<Array<byte>> decodeBinaryUriComponent(
+    ArrayPtr<const char> text, DecodeUriOptions options = DecodeUriOptions());
+// Decode URI components using % escapes. This is a lower-level interface used to implement both
+// `decodeUriComponent()` and `decodeWwwForm()`
 
 String encodeCEscape(ArrayPtr<const byte> bytes);
 String encodeCEscape(ArrayPtr<const char> bytes);
@@ -100,6 +210,9 @@ String encodeBase64(ArrayPtr<const byte> bytes, bool breakLines = false);
 EncodingResult<Array<byte>> decodeBase64(ArrayPtr<const char> text);
 // Decode base64 text. This function reports errors required by the WHATWG HTML/Infra specs: see
 // https://html.spec.whatwg.org/multipage/webappapis.html#atob for details.
+
+String encodeBase64Url(ArrayPtr<const byte> bytes);
+// Encode the given bytes as URL-safe base64 text. (RFC 4648, section 5)
 
 // =======================================================================================
 // inline implementation details
@@ -139,7 +252,26 @@ inline String encodeUriComponent(ArrayPtr<const char> text) {
   return encodeUriComponent(text.asBytes());
 }
 inline EncodingResult<String> decodeUriComponent(ArrayPtr<const char> text) {
-  auto result = decodeBinaryUriComponent(text, true);
+  auto result = decodeBinaryUriComponent(text, DecodeUriOptions { /*.nulTerminate=*/true });
+  return { String(result.releaseAsChars()), result.hadErrors };
+}
+
+inline String encodeUriFragment(ArrayPtr<const char> text) {
+  return encodeUriFragment(text.asBytes());
+}
+inline String encodeUriPath(ArrayPtr<const char> text) {
+  return encodeUriPath(text.asBytes());
+}
+inline String encodeUriUserInfo(ArrayPtr<const char> text) {
+  return encodeUriUserInfo(text.asBytes());
+}
+
+inline String encodeWwwForm(ArrayPtr<const char> text) {
+  return encodeWwwForm(text.asBytes());
+}
+inline EncodingResult<String> decodeWwwForm(ArrayPtr<const char> text) {
+  auto result = decodeBinaryUriComponent(text, DecodeUriOptions { /*.nulTerminate=*/true,
+                                                                  /*.plusToSpace=*/true });
   return { String(result.releaseAsChars()), result.hadErrors };
 }
 
@@ -164,12 +296,21 @@ inline EncodingResult<Array<char32_t>> encodeUtf32(const char (&text)[s], bool n
   return encodeUtf32(arrayPtr(text, s - 1), nulTerminate);
 }
 template <size_t s>
+inline EncodingResult<Array<wchar_t>> encodeWideString(
+    const char (&text)[s], bool nulTerminate=false) {
+  return encodeWideString(arrayPtr(text, s - 1), nulTerminate);
+}
+template <size_t s>
 inline EncodingResult<String> decodeUtf16(const char16_t (&utf16)[s]) {
   return decodeUtf16(arrayPtr(utf16, s - 1));
 }
 template <size_t s>
 inline EncodingResult<String> decodeUtf32(const char32_t (&utf32)[s]) {
   return decodeUtf32(arrayPtr(utf32, s - 1));
+}
+template <size_t s>
+inline EncodingResult<String> decodeWideString(const wchar_t (&utf32)[s]) {
+  return decodeWideString(arrayPtr(utf32, s - 1));
 }
 template <size_t s>
 inline EncodingResult<Array<byte>> decodeHex(const char (&text)[s]) {
@@ -186,6 +327,26 @@ inline Array<byte> decodeBinaryUriComponent(const char (&text)[s]) {
 template <size_t s>
 inline EncodingResult<String> decodeUriComponent(const char (&text)[s]) {
   return decodeUriComponent(arrayPtr(text, s-1));
+}
+template <size_t s>
+inline String encodeUriFragment(const char (&text)[s]) {
+  return encodeUriFragment(arrayPtr(text, s - 1));
+}
+template <size_t s>
+inline String encodeUriPath(const char (&text)[s]) {
+  return encodeUriPath(arrayPtr(text, s - 1));
+}
+template <size_t s>
+inline String encodeUriUserInfo(const char (&text)[s]) {
+  return encodeUriUserInfo(arrayPtr(text, s - 1));
+}
+template <size_t s>
+inline String encodeWwwForm(const char (&text)[s]) {
+  return encodeWwwForm(arrayPtr(text, s - 1));
+}
+template <size_t s>
+inline EncodingResult<String> decodeWwwForm(const char (&text)[s]) {
+  return decodeWwwForm(arrayPtr(text, s-1));
 }
 template <size_t s>
 inline String encodeCEscape(const char (&text)[s]) {
@@ -206,4 +367,4 @@ EncodingResult<Array<byte>> decodeBase64(const char (&text)[s]) {
 
 } // namespace kj
 
-#endif // KJ_ENCODING_H_
+KJ_END_HEADER

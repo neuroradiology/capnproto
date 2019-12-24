@@ -19,6 +19,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "lexer.h"
 #include "parser.h"
 #include "compiler.h"
@@ -42,9 +46,15 @@
 #include <capnp/compat/json.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <kj/map.h>
 
 #if _WIN32
 #include <process.h>
+#define WIN32_LEAN_AND_MEAN  // ::eyeroll::
+#include <windows.h>
+#include <kj/windows-sanity.h>
+#undef VOID
+#undef CONST
 #else
 #include <sys/wait.h>
 #endif
@@ -65,10 +75,10 @@ static const char VERSION_STRING[] = "Cap'n Proto version " VERSION;
 class CompilerMain final: public GlobalErrorReporter {
 public:
   explicit CompilerMain(kj::ProcessContext& context)
-      : context(context), loader(*this) {}
+      : context(context), disk(kj::newDiskFilesystem()), loader(*this) {}
 
   kj::MainFunc getMain() {
-    if (context.getProgramName().endsWith("capnpc")) {
+    if (context.getProgramName().endsWith("capnpc") || context.getProgramName().endsWith("capnpc.exe")) {
       kj::MainBuilder builder(context, VERSION_STRING,
             "Compiles Cap'n Proto schema files and generates corresponding source code in one or "
             "more languages.");
@@ -121,7 +131,7 @@ public:
     annotationFlag = Compiler::DROP_ANNOTATIONS;
 
     kj::MainBuilder builder(context, VERSION_STRING,
-          "Convers messages between formats. Reads a stream of messages from stdin in format "
+          "Converts messages between formats. Reads a stream of messages from stdin in format "
           "<from> and writes them to stdout in format <to>. Valid formats are:\n"
           "    binary      standard binary format\n"
           "    packed      packed binary format (deflates zeroes)\n"
@@ -305,8 +315,12 @@ public:
   // shared options
 
   kj::MainBuilder::Validity addImportPath(kj::StringPtr path) {
-    loader.addImportPath(kj::heapString(path));
-    return true;
+    KJ_IF_MAYBE(dir, getSourceDirectory(path, false)) {
+      loader.addImportPath(*dir);
+      return true;
+    } else {
+      return "no such directory";
+    }
   }
 
   kj::MainBuilder::Validity noStandardImport() {
@@ -315,31 +329,32 @@ public:
   }
 
   kj::MainBuilder::Validity addSource(kj::StringPtr file) {
-    // Strip redundant "./" prefixes to make src-prefix matching more lenient.
-    while (file.startsWith("./")) {
-      file = file.slice(2);
-
-      // Remove redundant slashes as well (e.g. ".////foo" -> "foo").
-      while (file.startsWith("/")) {
-        file = file.slice(1);
-      }
-    }
-
     if (!compilerConstructed) {
       compiler = compilerSpace.construct(annotationFlag);
       compilerConstructed = true;
     }
 
     if (addStandardImportPaths) {
-      loader.addImportPath(kj::heapString("/usr/local/include"));
-      loader.addImportPath(kj::heapString("/usr/include"));
+      static constexpr kj::StringPtr STANDARD_IMPORT_PATHS[] = {
+        "/usr/local/include"_kj,
+        "/usr/include"_kj,
 #ifdef CAPNP_INCLUDE_DIR
-      loader.addImportPath(kj::heapString(CAPNP_INCLUDE_DIR));
+        KJ_CONCAT(CAPNP_INCLUDE_DIR, _kj),
 #endif
+      };
+      for (auto path: STANDARD_IMPORT_PATHS) {
+        KJ_IF_MAYBE(dir, getSourceDirectory(path, false)) {
+          loader.addImportPath(*dir);
+        } else {
+          // ignore standard path that doesn't exist
+        }
+      }
+
       addStandardImportPaths = false;
     }
 
-    KJ_IF_MAYBE(module, loadModule(file)) {
+    auto dirPathPair = interpretSourceFile(file);
+    KJ_IF_MAYBE(module, loader.loadModule(dirPathPair.dir, dirPathPair.path)) {
       uint64_t id = compiler->add(*module);
       compiler->eagerlyCompile(id, compileEagerness);
       sourceFiles.add(SourceFile { id, module->getSourceName(), &*module });
@@ -348,20 +363,6 @@ public:
     }
 
     return true;
-  }
-
-private:
-  kj::Maybe<Module&> loadModule(kj::StringPtr file) {
-    size_t longestPrefix = 0;
-
-    for (auto& prefix: sourcePrefixes) {
-      if (file.startsWith(prefix)) {
-        longestPrefix = kj::max(longestPrefix, prefix.size());
-      }
-    }
-
-    kj::StringPtr canonicalName = file.slice(longestPrefix);
-    return loader.loadModule(file, canonicalName);
   }
 
 public:
@@ -381,10 +382,14 @@ public:
       kj::StringPtr dir = spec.slice(*split + 1);
       auto plugin = spec.slice(0, *split);
 
-      KJ_IF_MAYBE(split2, dir.findFirst(':')) {
-        // Grr, there are two colons. Might this be a Windows path? Let's do some heuristics.
-        if (*split == 1 && (dir.startsWith("/") || dir.startsWith("\\"))) {
-          // So, the first ':' was the second char, and was followed by '/' or '\', e.g.:
+      if (*split == 1 && (dir.startsWith("/") || dir.startsWith("\\"))) {
+        // The colon is the second character and is immediately followed by a slash or backslash.
+        // So, the user passed something like `-o c:/foo`. Is this a request to run the C plugin
+        // and output to `/foo`? Or are we on Windows, and is this a request to run the plugin
+        // `c:/foo`?
+        KJ_IF_MAYBE(split2, dir.findFirst(':')) {
+          // There are two colons. The first ':' was the second char, and was followed by '/' or
+          // '\', e.g.:
           //     capnp compile -o c:/foo.exe:bar
           //
           // In this case we can conclude that the second colon is actually meant to be the
@@ -406,18 +411,24 @@ public:
           //   -> CONTRADICTION
           //
           // We therefore conclude that the *second* colon is in fact the plugin/location separator.
-          //
-          // Note that there is still an ambiguous case:
-          //     capnp compile -o c:/foo
-          //
-          // In this unfortunate case, we have no way to tell if the user meant "use the 'c' plugin
-          // and output to /foo" or "use the plugin c:/foo and output to the default location". We
-          // prefer the former interpretation, because the latter is Windows-specific and such
-          // users can always explicitly specify the output location like:
-          //     capnp compile -o c:/foo:.
 
           dir = dir.slice(*split2 + 1);
           plugin = spec.slice(0, *split2 + 2);
+#if _WIN32
+        } else {
+          // The user wrote something like:
+          //
+          //     capnp compile -o c:/foo/bar
+          //
+          // What does this mean? It depends on what system we're on. On a Unix system, the above
+          // clearly is a request to run the `capnpc-c` plugin (perhaps to output C code) and write
+          // to the directory /foo/bar. But on Windows, absolute paths do not start with '/', and
+          // the above is actually a request to run the plugin `c:/foo/bar`, outputting to the
+          // current directory.
+
+          outputs.add(OutputDirective { spec.asArray(), nullptr });
+          return true;
+#endif
         }
       }
 
@@ -425,7 +436,7 @@ public:
       if (stat(dir.cStr(), &stats) < 0 || !S_ISDIR(stats.st_mode)) {
         return "output location is inaccessible or is not a directory";
       }
-      outputs.add(OutputDirective { plugin, dir });
+      outputs.add(OutputDirective { plugin, disk->getCurrentPath().evalNative(dir) });
     } else {
       outputs.add(OutputDirective { spec.asArray(), nullptr });
     }
@@ -434,22 +445,11 @@ public:
   }
 
   kj::MainBuilder::Validity addSourcePrefix(kj::StringPtr prefix) {
-    // Strip redundant "./" prefixes to make src-prefix matching more lenient.
-    while (prefix.startsWith("./")) {
-      prefix = prefix.slice(2);
-    }
-
-    if (prefix == "" || prefix == ".") {
-      // Irrelevant prefix.
+    if (getSourceDirectory(prefix, true) == nullptr) {
+      return "no such directory";
+    } else {
       return true;
     }
-
-    if (prefix.endsWith("/")) {
-      sourcePrefixes.add(kj::heapString(prefix));
-    } else {
-      sourcePrefixes.add(kj::str(prefix, '/'));
-    }
-    return true;
   }
 
   kj::MainBuilder::Validity generateOutput() {
@@ -541,17 +541,30 @@ public:
         KJ_SYSCALL(dup2(pipeFds[0], STDIN_FILENO));
         KJ_SYSCALL(close(pipeFds[0]));
 
-        if (output.dir != nullptr) {
-          KJ_SYSCALL(chdir(output.dir.cStr()), output.dir);
+        KJ_IF_MAYBE(d, output.dir) {
+#if _WIN32
+          KJ_SYSCALL(SetCurrentDirectoryW(d->forWin32Api(true).begin()), d->toWin32String(true));
+#else
+          auto wd = d->toString(true);
+          KJ_SYSCALL(chdir(wd.cStr()), wd);
+          KJ_SYSCALL(setenv("PWD", wd.cStr(), true));
+#endif
         }
+
+#if _WIN32
+        // MSVCRT's spawn*() don't correctly escape arguments, which is necessary on Windows
+        // since the underlying system call takes a single command line string rather than
+        // an arg list. We do the escaping ourselves by wrapping the name in quotes. We know
+        // that exeName itself can't contain quotes (since filenames aren't allowed to contain
+        // quotes on Windows), so we don't have to account for those.
+        KJ_ASSERT(exeName.findFirst('\"') == nullptr,
+            "Windows filenames can't contain quotes", exeName);
+        auto escapedExeName = kj::str("\"", exeName, "\"");
+#endif
 
         if (shouldSearchPath) {
 #if _WIN32
-          // MSVCRT's spawn*() don't correctly escape arguments, which is necessary on Windows
-          // since the underlying system call takes a single command line string rather than
-          // an arg list. Instead of trying to do the escaping ourselves, we just pass "plugin"
-          // for argv[0].
-          child = _spawnlp(_P_NOWAIT, exeName.cStr(), "plugin", nullptr);
+          child = _spawnlp(_P_NOWAIT, exeName.cStr(), escapedExeName.cStr(), nullptr);
 #else
           execlp(exeName.cStr(), exeName.cStr(), nullptr);
 #endif
@@ -567,11 +580,7 @@ public:
           }
 
 #if _WIN32
-          // MSVCRT's spawn*() don't correctly escape arguments, which is necessary on Windows
-          // since the underlying system call takes a single command line string rather than
-          // an arg list. Instead of trying to do the escaping ourselves, we just pass "plugin"
-          // for argv[0].
-          child = _spawnl(_P_NOWAIT, exeName.cStr(), "plugin", nullptr);
+          child = _spawnl(_P_NOWAIT, exeName.cStr(), escapedExeName.cStr(), nullptr);
 #else
           execl(exeName.cStr(), exeName.cStr(), nullptr);
 #endif
@@ -713,6 +722,13 @@ public:
         convertTo = *t;
       } else {
         return kj::str("unknown format: ", to);
+      }
+
+      if (convertFrom == Format::JSON || convertTo == Format::JSON) {
+        // We need annotations to process JSON.
+        // TODO(someday): Find a way that we can process annotations from json.capnp without
+        //   requiring other annotation-only imports like c++.capnp
+        annotationFlag = Compiler::COMPILE_ANNOTATIONS;
       }
 
       return true;
@@ -1039,6 +1055,7 @@ private:
         MallocMessageBuilder message;
         JsonCodec codec;
         codec.setPrettyPrint(pretty);
+        codec.handleByAnnotation(rootType);
         auto root = message.initRoot<DynamicStruct>(rootType);
         codec.decode(text, root);
         return writeConversion(root.asReader(), output);
@@ -1097,6 +1114,7 @@ private:
       case Format::JSON: {
         JsonCodec codec;
         codec.setPrettyPrint(pretty);
+        codec.handleByAnnotation(rootType);
         auto text = codec.encode(reader.as<DynamicStruct>(rootType));
         output.write({text.asBytes(), kj::StringPtr("\n").asBytes()});
         return;
@@ -1359,7 +1377,7 @@ private:
   }
 
   Plausibility isPlausiblyText(kj::ArrayPtr<const byte> prefix) {
-    enum { PREAMBLE, COMMENT, BODY } state;
+    enum { PREAMBLE, COMMENT, BODY } state = PREAMBLE;
 
     for (char c: prefix.asChars()) {
       switch (state) {
@@ -1398,7 +1416,8 @@ private:
           break;
       }
 
-      if ((c >= 0 && c < ' ' && c != '\n' && c != '\r' && c != '\t' && c != '\v') || c == 0x7f) {
+      if ((static_cast<uint8_t>(c) < 0x20 && c != '\n' && c != '\r' && c != '\t' && c != '\v')
+          || c == 0x7f) {
         // Unprintable character.
         return IMPOSSIBLE;
       }
@@ -1408,7 +1427,7 @@ private:
   }
 
   Plausibility isPlausiblyJson(kj::ArrayPtr<const byte> prefix) {
-    enum { PREAMBLE, COMMENT, BODY } state;
+    enum { PREAMBLE, COMMENT, BODY } state = PREAMBLE;
 
     for (char c: prefix.asChars()) {
       switch (state) {
@@ -1725,8 +1744,11 @@ public:
 public:
   // =====================================================================================
 
-  void addError(kj::StringPtr file, SourcePos start, SourcePos end,
+  void addError(const kj::ReadableDirectory& directory, kj::PathPtr path,
+                SourcePos start, SourcePos end,
                 kj::StringPtr message) override {
+    auto file = getDisplayName(directory, path);
+
     kj::String wholeMessage;
     if (end.line == start.line) {
       if (end.column == start.column) {
@@ -1751,6 +1773,7 @@ public:
 
 private:
   kj::ProcessContext& context;
+  kj::Own<kj::Filesystem> disk;
   ModuleLoader loader;
   kj::SpaceFor<Compiler> compilerSpace;
   bool compilerConstructed = false;
@@ -1764,7 +1787,23 @@ private:
   // of those schemas, plus the parent nodes of any dependencies.  This is what most code generators
   // require to function.
 
-  kj::Vector<kj::String> sourcePrefixes;
+  struct SourceDirectory {
+    kj::Own<const kj::ReadableDirectory> dir;
+    bool isSourcePrefix;
+  };
+
+  kj::HashMap<kj::Path, SourceDirectory> sourceDirectories;
+  // For each import path and source prefix, tracks the directory object we opened for it.
+  //
+  // Use via getSourceDirectory().
+
+  kj::HashMap<const kj::ReadableDirectory*, kj::String> dirPrefixes;
+  // For each open directory object, maps to a path prefix to add when displaying this path in
+  // error messages. This keeps track of the original directory name as given by the user, before
+  // canonicalization.
+  //
+  // Use via getDisplayName().
+
   bool addStandardImportPaths = true;
 
   Format convertFrom = Format::BINARY;
@@ -1790,11 +1829,117 @@ private:
 
   struct OutputDirective {
     kj::ArrayPtr<const char> name;
-    kj::StringPtr dir;
+    kj::Maybe<kj::Path> dir;
+
+    KJ_DISALLOW_COPY(OutputDirective);
+    OutputDirective(OutputDirective&&) = default;
+    OutputDirective(kj::ArrayPtr<const char> name, kj::Maybe<kj::Path> dir)
+        : name(name), dir(kj::mv(dir)) {}
   };
   kj::Vector<OutputDirective> outputs;
 
   bool hadErrors_ = false;
+
+  kj::Maybe<const kj::ReadableDirectory&> getSourceDirectory(
+      kj::StringPtr pathStr, bool isSourcePrefix) {
+    auto cwd = disk->getCurrentPath();
+    auto path = cwd.evalNative(pathStr);
+
+    if (path.size() == 0) return disk->getRoot();
+
+    KJ_IF_MAYBE(sdir, sourceDirectories.find(path)) {
+      sdir->isSourcePrefix = sdir->isSourcePrefix || isSourcePrefix;
+      return *sdir->dir;
+    }
+
+    if (path == cwd) {
+      // Slight hack if the working directory is explicitly specified:
+      // - We want to avoid opening a new copy of the working directory, as tryOpenSubdir() would
+      //   do.
+      // - If isSourcePrefix is true, we need to add it to sourceDirectories to track that.
+      //   Otherwise we don't need to add it at all.
+      // - We do not need to add it to dirPrefixes since the cwd is already handled in
+      //   getDisplayName().
+      auto& result = disk->getCurrent();
+      if (isSourcePrefix) {
+        kj::Own<const kj::ReadableDirectory> fakeOwn(&result, kj::NullDisposer::instance);
+        sourceDirectories.insert(kj::mv(path), { kj::mv(fakeOwn), isSourcePrefix });
+      }
+      return result;
+    }
+
+    KJ_IF_MAYBE(dir, disk->getRoot().tryOpenSubdir(path)) {
+      auto& result = *dir->get();
+      sourceDirectories.insert(kj::mv(path), { kj::mv(*dir), isSourcePrefix });
+#if _WIN32
+      kj::String prefix = pathStr.endsWith("/") || pathStr.endsWith("\\")
+                        ? kj::str(pathStr) : kj::str(pathStr, '\\');
+#else
+      kj::String prefix = pathStr.endsWith("/") ? kj::str(pathStr) : kj::str(pathStr, '/');
+#endif
+      dirPrefixes.insert(&result, kj::mv(prefix));
+      return result;
+    } else {
+      return nullptr;
+    }
+  }
+
+  struct DirPathPair {
+    const kj::ReadableDirectory& dir;
+    kj::Path path;
+  };
+
+  DirPathPair interpretSourceFile(kj::StringPtr pathStr) {
+    auto cwd = disk->getCurrentPath();
+    auto path = cwd.evalNative(pathStr);
+
+    KJ_REQUIRE(path.size() > 0);
+    for (size_t i = path.size() - 1; i > 0; i--) {
+      auto prefix = path.slice(0, i);
+      auto remainder = path.slice(i, path.size());
+
+      KJ_IF_MAYBE(sdir, sourceDirectories.find(prefix)) {
+        if (sdir->isSourcePrefix) {
+          return { *sdir->dir, remainder.clone() };
+        }
+      }
+    }
+
+    // No source prefix matched. Fall back to heuristic: try stripping the current directory,
+    // otherwise don't strip anything.
+    if (path.startsWith(cwd)) {
+      return { disk->getCurrent(), path.slice(cwd.size(), path.size()).clone() };
+    } else {
+      // Hmm, no src-prefix matched and the file isn't even in the current directory. This might
+      // be OK if we aren't generating any output anyway, but otherwise the results will almost
+      // certainly not be what the user wanted. Let's print a warning, unless the output directives
+      // are ones which we know do not produce output files. This is a hack.
+      for (auto& output: outputs) {
+        auto name = kj::str(output.name);
+        if (name != "-" && name != "capnp") {
+          context.warning(kj::str(pathStr,
+              ": File is not in the current directory and does not match any prefix defined with "
+              "--src-prefix. Please pass an appropriate --src-prefix so I can figure out where to "
+              "write the output for this file."));
+          break;
+        }
+      }
+
+      return { disk->getRoot(), kj::mv(path) };
+    }
+  }
+
+  kj::String getDisplayName(const kj::ReadableDirectory& dir, kj::PathPtr path) {
+    KJ_IF_MAYBE(prefix, dirPrefixes.find(&dir)) {
+      return kj::str(*prefix, path.toNativeString());
+    } else if (&dir == &disk->getRoot()) {
+      return path.toNativeString(true);
+    } else if (&dir == &disk->getCurrent()) {
+      return path.toNativeString(false);
+    } else {
+      KJ_FAIL_ASSERT("unrecognized directory");
+    }
+  }
 };
 
 }  // namespace compiler

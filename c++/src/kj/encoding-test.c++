@@ -30,6 +30,7 @@ CappedArray<char, sizeof(char    ) * 2 + 1> hex(byte     i) { return kj::hex((ui
 CappedArray<char, sizeof(char    ) * 2 + 1> hex(char     i) { return kj::hex((uint8_t )i); }
 CappedArray<char, sizeof(char16_t) * 2 + 1> hex(char16_t i) { return kj::hex((uint16_t)i); }
 CappedArray<char, sizeof(char32_t) * 2 + 1> hex(char32_t i) { return kj::hex((uint32_t)i); }
+CappedArray<char, sizeof(uint32_t) * 2 + 1> hex(wchar_t  i) { return kj::hex((uint32_t)i); }
 // Hexify chars correctly.
 //
 // TODO(cleanup): Should this go into string.h with the other definitions of hex()?
@@ -63,6 +64,13 @@ void expectRes(EncodingResult<T> result,
                bool errors = false) {
   expectResImpl(kj::mv(result), arrayPtr<const byte>(expected, s), errors);
 }
+
+// Handy reference for surrogate pair edge cases:
+//
+// \ud800 -> \xed\xa0\x80
+// \udc00 -> \xed\xb0\x80
+// \udbff -> \xed\xaf\xbf
+// \udfff -> \xed\xbf\xbf
 
 KJ_TEST("encode UTF-8 to UTF-16") {
   expectRes(encodeUtf16(u8"foo"), u"foo");
@@ -113,6 +121,21 @@ KJ_TEST("invalid UTF-8 to UTF-16") {
   expectRes(encodeUtf16("\xfc\xbf\x80\x80\x80\x80"), u"\ufffd", true);
   expectRes(encodeUtf16("\xfe\xbf\x80\x80\x80\x80\x80"), u"\ufffd", true);
   expectRes(encodeUtf16("\xff\xbf\x80\x80\x80\x80\x80\x80"), u"\ufffd", true);
+
+  // Surrogates encoded as separate UTF-8 code points are flagged as errors but allowed to decode
+  // to UTF-16 surrogate values.
+  expectRes(encodeUtf16("\xed\xb0\x80\xed\xaf\xbf"), u"\xdc00\xdbff", true);
+  expectRes(encodeUtf16("\xed\xbf\xbf\xed\xa0\x80"), u"\xdfff\xd800", true);
+
+  expectRes(encodeUtf16("\xed\xb0\x80\xed\xbf\xbf"), u"\xdc00\xdfff", true);
+  expectRes(encodeUtf16("f\xed\xa0\x80"), u"f\xd800", true);
+  expectRes(encodeUtf16("f\xed\xa0\x80x"), u"f\xd800x", true);
+  expectRes(encodeUtf16("f\xed\xa0\x80\xed\xa0\x80x"), u"f\xd800\xd800x", true);
+
+  // However, if successive UTF-8 codepoints decode to a proper surrogate pair, the second
+  // surrogate is replaced with the Unicode replacement character to avoid creating valid UTF-16.
+  expectRes(encodeUtf16("\xed\xa0\x80\xed\xbf\xbf"), u"\xd800\xfffd", true);
+  expectRes(encodeUtf16("\xed\xaf\xbf\xed\xb0\x80"), u"\xdbff\xfffd", true);
 }
 
 KJ_TEST("encode UTF-8 to UTF-32") {
@@ -169,12 +192,15 @@ KJ_TEST("decode UTF-16 to UTF-8") {
 
 KJ_TEST("invalid UTF-16 to UTF-8") {
   // Surrogates in wrong order.
-  expectRes(decodeUtf16(u"\xd7ff\xdc00\xdfff\xe000"), u8"\ud7ff\ufffd\ufffd\ue000", true);
+  expectRes(decodeUtf16(u"\xdc00\xdbff"),
+      "\xed\xb0\x80\xed\xaf\xbf", true);
+  expectRes(decodeUtf16(u"\xdfff\xd800"),
+      "\xed\xbf\xbf\xed\xa0\x80", true);
 
   // Missing second surrogate.
-  expectRes(decodeUtf16(u"f\xd800"), u8"f\ufffd", true);
-  expectRes(decodeUtf16(u"f\xd800x"), u8"f\ufffdx", true);
-  expectRes(decodeUtf16(u"f\xd800\xd800x"), u8"f\ufffd\ufffdx", true);
+  expectRes(decodeUtf16(u"f\xd800"), "f\xed\xa0\x80", true);
+  expectRes(decodeUtf16(u"f\xd800x"), "f\xed\xa0\x80x", true);
+  expectRes(decodeUtf16(u"f\xd800\xd800x"), "f\xed\xa0\x80\xed\xa0\x80x", true);
 }
 
 KJ_TEST("decode UTF-32 to UTF-8") {
@@ -186,10 +212,19 @@ KJ_TEST("decode UTF-32 to UTF-8") {
 
 KJ_TEST("invalid UTF-32 to UTF-8") {
   // Surrogates rejected.
-  expectRes(decodeUtf32(U"\xd7ff\xdc00\xdfff\xe000"), u8"\ud7ff\ufffd\ufffd\ue000", true);
+  expectRes(decodeUtf32(U"\xdfff\xd800"),
+      "\xed\xbf\xbf\xed\xa0\x80", true);
 
   // Even if it would be a valid surrogate pair in UTF-16.
-  expectRes(decodeUtf32(U"\xd7ff\xd800\xdfff\xe000"), u8"\ud7ff\ufffd\ufffd\ue000", true);
+  expectRes(decodeUtf32(U"\xd800\xdfff"),
+      "\xed\xa0\x80\xed\xbf\xbf", true);
+}
+
+KJ_TEST("round-trip invalid UTF-16") {
+  const char16_t INVALID[] = u"\xdfff foo \xd800\xdc00 bar \xdc00\xd800 baz \xdbff qux \xd800";
+
+  expectRes(encodeUtf16(decodeUtf16(INVALID)), INVALID, true);
+  expectRes(encodeUtf16(decodeUtf32(encodeUtf32(decodeUtf16(INVALID)))), INVALID, true);
 }
 
 KJ_TEST("EncodingResult as a Maybe") {
@@ -204,6 +239,20 @@ KJ_TEST("EncodingResult as a Maybe") {
   }
 
   KJ_EXPECT(KJ_ASSERT_NONNULL(decodeUtf16(u"foo")) == "foo");
+}
+
+KJ_TEST("encode to wchar_t") {
+  expectRes(encodeWideString(u8"foo"), L"foo");
+  expectRes(encodeWideString(u8"Здравствуйте"), L"Здравствуйте");
+  expectRes(encodeWideString(u8"中国网络"), L"中国网络");
+  expectRes(encodeWideString(u8"😺☁☄🐵"), L"😺☁☄🐵");
+}
+
+KJ_TEST("decode from wchar_t") {
+  expectRes(decodeWideString(L"foo"), u8"foo");
+  expectRes(decodeWideString(L"Здравствуйте"), u8"Здравствуйте");
+  expectRes(decodeWideString(L"中国网络"), u8"中国网络");
+  expectRes(decodeWideString(L"😺☁☄🐵"), u8"😺☁☄🐵");
 }
 
 // =======================================================================================
@@ -224,11 +273,20 @@ KJ_TEST("hex encoding/decoding") {
   expectRes(decodeHex("1234xbf2"), bytes, true);
 }
 
+constexpr char RFC2396_FRAGMENT_SET_DIFF[] = "#$&+,/:;=?@[\\]^{|}";
+// These are the characters reserved in RFC 2396, but not in the fragment percent encode set.
+
 KJ_TEST("URI encoding/decoding") {
   KJ_EXPECT(encodeUriComponent("foo") == "foo");
   KJ_EXPECT(encodeUriComponent("foo bar") == "foo%20bar");
   KJ_EXPECT(encodeUriComponent("\xab\xba") == "%AB%BA");
   KJ_EXPECT(encodeUriComponent(StringPtr("foo\0bar", 7)) == "foo%00bar");
+
+  KJ_EXPECT(encodeUriComponent(RFC2396_FRAGMENT_SET_DIFF) ==
+            "%23%24%26%2B%2C%2F%3A%3B%3D%3F%40%5B%5C%5D%5E%7B%7C%7D");
+
+  // Encode characters reserved by application/x-www-form-urlencoded, but not by RFC 2396.
+  KJ_EXPECT(encodeUriComponent("'foo'! (~)") == "'foo'!%20(~)");
 
   expectRes(decodeUriComponent("foo%20bar"), "foo bar");
   expectRes(decodeUriComponent("%ab%BA"), "\xab\xba");
@@ -238,8 +296,69 @@ KJ_TEST("URI encoding/decoding") {
   expectRes(decodeUriComponent("foo%xxx"), "fooxxx", true);
   expectRes(decodeUriComponent("foo%"), "foo", true);
 
-  byte bytes[] = {12, 34, 56};
-  KJ_EXPECT(decodeBinaryUriComponent(encodeUriComponent(bytes)).asPtr() == bytes);
+  {
+    byte bytes[] = {12, 34, 56};
+    KJ_EXPECT(decodeBinaryUriComponent(encodeUriComponent(bytes)).asPtr() == bytes);
+
+    // decodeBinaryUriComponent() takes a DecodeUriOptions struct as its second parameter, but it
+    // once took a single `bool nulTerminate`. Verify that the old behavior still compiles and
+    // works.
+    auto bytesWithNul = decodeBinaryUriComponent(encodeUriComponent(bytes), true);
+    KJ_ASSERT(bytesWithNul.size() == 4);
+    KJ_EXPECT(bytesWithNul[3] == '\0');
+    KJ_EXPECT(bytesWithNul.slice(0, 3) == bytes);
+  }
+}
+
+KJ_TEST("URL component encoding") {
+  KJ_EXPECT(encodeUriFragment("foo") == "foo");
+  KJ_EXPECT(encodeUriFragment("foo bar") == "foo%20bar");
+  KJ_EXPECT(encodeUriFragment("\xab\xba") == "%AB%BA");
+  KJ_EXPECT(encodeUriFragment(StringPtr("foo\0bar", 7)) == "foo%00bar");
+
+  KJ_EXPECT(encodeUriFragment(RFC2396_FRAGMENT_SET_DIFF) == RFC2396_FRAGMENT_SET_DIFF);
+
+  KJ_EXPECT(encodeUriPath("foo") == "foo");
+  KJ_EXPECT(encodeUriPath("foo bar") == "foo%20bar");
+  KJ_EXPECT(encodeUriPath("\xab\xba") == "%AB%BA");
+  KJ_EXPECT(encodeUriPath(StringPtr("foo\0bar", 7)) == "foo%00bar");
+
+  KJ_EXPECT(encodeUriPath(RFC2396_FRAGMENT_SET_DIFF) == "%23$&+,%2F:;=%3F@[%5C]^%7B|%7D");
+
+  KJ_EXPECT(encodeUriUserInfo("foo") == "foo");
+  KJ_EXPECT(encodeUriUserInfo("foo bar") == "foo%20bar");
+  KJ_EXPECT(encodeUriUserInfo("\xab\xba") == "%AB%BA");
+  KJ_EXPECT(encodeUriUserInfo(StringPtr("foo\0bar", 7)) == "foo%00bar");
+
+  KJ_EXPECT(encodeUriUserInfo(RFC2396_FRAGMENT_SET_DIFF) ==
+            "%23$&+,%2F%3A%3B%3D%3F%40%5B%5C%5D%5E%7B%7C%7D");
+
+  // NOTE: None of these functions have explicit decode equivalents.
+}
+
+KJ_TEST("application/x-www-form-urlencoded encoding/decoding") {
+  KJ_EXPECT(encodeWwwForm("foo") == "foo");
+  KJ_EXPECT(encodeWwwForm("foo bar") == "foo+bar");
+  KJ_EXPECT(encodeWwwForm("\xab\xba") == "%AB%BA");
+  KJ_EXPECT(encodeWwwForm(StringPtr("foo\0bar", 7)) == "foo%00bar");
+
+  // Encode characters reserved by application/x-www-form-urlencoded, but not by RFC 2396.
+  KJ_EXPECT(encodeWwwForm("'foo'! (~)") == "%27foo%27%21+%28%7E%29");
+
+  expectRes(decodeWwwForm("foo%20bar"), "foo bar");
+  expectRes(decodeWwwForm("foo+bar"), "foo bar");
+  expectRes(decodeWwwForm("%ab%BA"), "\xab\xba");
+
+  expectRes(decodeWwwForm("foo%1xxx"), "foo\1xxx", true);
+  expectRes(decodeWwwForm("foo%1"), "foo\1", true);
+  expectRes(decodeWwwForm("foo%xxx"), "fooxxx", true);
+  expectRes(decodeWwwForm("foo%"), "foo", true);
+
+  {
+    byte bytes[] = {12, 34, 56};
+    DecodeUriOptions options { /*.nulTerminate=*/false, /*.plusToSpace=*/true };
+    KJ_EXPECT(decodeBinaryUriComponent(encodeWwwForm(bytes), options) == bytes);
+  }
 }
 
 KJ_TEST("C escape encoding/decoding") {
@@ -353,6 +472,51 @@ KJ_TEST("base64 encoding/decoding") {
         encoded == "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIz\n"
                    "NDU2\n",
         encoded);
+  }
+}
+
+KJ_TEST("base64 url encoding") {
+  {
+    // Handles empty.
+    auto encoded = encodeBase64Url(StringPtr("").asBytes());
+    KJ_EXPECT(encoded == "", encoded, encoded.size());
+  }
+
+  {
+    // Handles paddingless encoding.
+    auto encoded = encodeBase64Url(StringPtr("foo").asBytes());
+    KJ_EXPECT(encoded == "Zm9v", encoded, encoded.size());
+  }
+
+  {
+    // Handles padded encoding.
+    auto encoded1 = encodeBase64Url(StringPtr("quux").asBytes());
+    KJ_EXPECT(encoded1 == "cXV1eA", encoded1, encoded1.size());
+    auto encoded2 = encodeBase64Url(StringPtr("corge").asBytes());
+    KJ_EXPECT(encoded2 == "Y29yZ2U", encoded2, encoded2.size());
+  }
+
+  {
+    // No line breaks.
+    StringPtr fullLine = "012345678901234567890123456789012345678901234567890123";
+    auto encoded = encodeBase64Url(StringPtr(fullLine).asBytes());
+    KJ_EXPECT(
+        encoded == "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIz",
+        encoded);
+  }
+
+  {
+    // Replaces plusses.
+    const byte data[] = { 0b11111011, 0b11101111, 0b10111110 };
+    auto encoded = encodeBase64Url(data);
+    KJ_EXPECT(encoded == "----", encoded, encoded.size(), data);
+  }
+
+  {
+    // Replaces slashes.
+    const byte data[] = { 0b11111111, 0b11111111, 0b11111111 };
+    auto encoded = encodeBase64Url(data);
+    KJ_EXPECT(encoded == "____", encoded, encoded.size(), data);
   }
 }
 

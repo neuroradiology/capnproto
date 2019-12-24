@@ -19,14 +19,31 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef KJ_COMPAT_URL_H_
-#define KJ_COMPAT_URL_H_
+#pragma once
 
 #include <kj/string.h>
 #include <kj/vector.h>
 #include <inttypes.h>
 
 namespace kj {
+
+struct UrlOptions {
+  // A bag of options that you can pass to Url::parse()/tryParse() to customize the parser's
+  // behavior.
+  //
+  // A copy of this options struct will be stored in the parsed Url object, at which point it
+  // controls the behavior of the serializer in Url::toString().
+
+  bool percentDecode = true;
+  // True if URL components should be automatically percent-decoded during parsing, and
+  // percent-encoded during serialization.
+
+  bool allowEmpty = false;
+  // Whether or not to allow empty path and query components when parsing; otherwise, they are
+  // silently removed. In other words, setting this false causes consecutive slashes in the path or
+  // consecutive ampersands in the query to be collapsed into one, whereas if true then they
+  // produce empty components.
+};
 
 struct Url {
   // Represents a URL (or, more accurately, a URI, but whatever).
@@ -64,10 +81,20 @@ struct Url {
   };
   Vector<QueryParam> query;
   // Query, e.g. from "?key=value&key2=value2". If a component of the query contains no '=' sign,
-  // it will be parsed as a key with an empty value.
+  // it will be parsed as a key with a null value, and later serialized with no '=' sign if you call
+  // Url::toString().
+  //
+  // To distinguish between null-valued and empty-valued query parameters, we test whether
+  // QueryParam::value is an allocated or unallocated string. For example:
+  //
+  //     QueryParam { kj::str("name"), nullptr }      // Null-valued; will not have an '=' sign.
+  //     QueryParam { kj::str("name"), kj::str("") }  // Empty-valued; WILL have an '=' sign.
 
   Maybe<String> fragment;
   // The stuff after the '#' character (not including the '#' character itself), if present.
+
+  using Options = UrlOptions;
+  Options options;
 
   // ---------------------------------------------------------------------------
 
@@ -75,15 +102,6 @@ struct Url {
   Url(Url&&) = default;
   ~Url() noexcept(false);
   Url& operator=(Url&&) = default;
-
-#if __cplusplus < 201402L
-  inline Url(String&& scheme, Maybe<UserInfo>&& userInfo, String&& host, Vector<String>&& path,
-             bool hasTrailingSlash, Vector<QueryParam>&& query, Maybe<String>&& fragment)
-      : scheme(kj::mv(scheme)), userInfo(kj::mv(userInfo)), host(kj::mv(host)), path(kj::mv(path)),
-        hasTrailingSlash(hasTrailingSlash), query(kj::mv(query)), fragment(kj::mv(fragment)) {}
-  // TODO(cleanup): This constructor is only here to support brace initialization in C++11. It
-  //   should be removed once we upgrade to C++14.
-#endif
 
   Url clone() const;
 
@@ -108,8 +126,8 @@ struct Url {
   kj::String toString(Context context = REMOTE_HREF) const;
   // Convert the URL to a string.
 
-  static Url parse(StringPtr text, Context context = REMOTE_HREF);
-  static Maybe<Url> tryParse(StringPtr text, Context context = REMOTE_HREF);
+  static Url parse(StringPtr text, Context context = REMOTE_HREF, Options options = {});
+  static Maybe<Url> tryParse(StringPtr text, Context context = REMOTE_HREF, Options options = {});
   // Parse an absolute URL.
 
   Url parseRelative(StringPtr relative) const;
@@ -118,5 +136,3 @@ struct Url {
 };
 
 } // namespace kj
-
-#endif // KJ_COMPAT_URL_H_

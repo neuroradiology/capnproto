@@ -19,15 +19,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef CAPNP_EZ_RPC_H_
-#define CAPNP_EZ_RPC_H_
-
-#if defined(__GNUC__) && !defined(CAPNP_HEADER_WARNINGS)
-#pragma GCC system_header
-#endif
+#pragma once
 
 #include "rpc.h"
 #include "message.h"
+
+CAPNP_BEGIN_HEADER
 
 struct sockaddr;
 
@@ -251,4 +248,4 @@ inline typename Type::Client EzRpcClient::importCap(kj::StringPtr name) {
 
 }  // namespace capnp
 
-#endif  // CAPNP_EZ_RPC_H_
+CAPNP_END_HEADER
