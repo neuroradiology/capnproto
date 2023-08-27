@@ -27,19 +27,54 @@
 #include <kj/map.h>
 #include "byte-stream.h"
 
+CAPNP_BEGIN_HEADER
+
 namespace capnp {
 
 class HttpOverCapnpFactory {
 public:
-  HttpOverCapnpFactory(ByteStreamFactory& streamFactory,
-                       kj::HttpHeaderTable::Builder& headerTableBuilder);
+  class HeaderIdBundle {
+  public:
+    HeaderIdBundle(kj::HttpHeaderTable::Builder& builder);
+
+    HeaderIdBundle clone() const;
+
+  private:
+    HeaderIdBundle(const kj::HttpHeaderTable& table, kj::Array<kj::HttpHeaderId> nameCapnpToKj,
+        size_t maxHeaderId);
+    // Constructor for clone().
+
+    const kj::HttpHeaderTable& table;
+
+    kj::Array<kj::HttpHeaderId> nameCapnpToKj;
+    size_t maxHeaderId = 0;
+
+    friend class HttpOverCapnpFactory;
+  };
+
+  enum OptimizationLevel {
+    // Specifies the protocol optimization level supported by the remote peer. Setting this higher
+    // will improve efficiency but breaks compatibility with older peers that don't implement newer
+    // levels.
+
+    LEVEL_1,
+    // Use startRequest(), the original version of the protocol.
+
+    LEVEL_2
+    // Use request(). This is more efficient than startRequest() but won't work with old peers that
+    // only implement startRequest().
+  };
+
+  HttpOverCapnpFactory(ByteStreamFactory& streamFactory, HeaderIdBundle headerIds,
+                       OptimizationLevel peerOptimizationLevel = LEVEL_1);
 
   kj::Own<kj::HttpService> capnpToKj(capnp::HttpService::Client rpcService);
   capnp::HttpService::Client kjToCapnp(kj::Own<kj::HttpService> service);
 
 private:
   ByteStreamFactory& streamFactory;
-  kj::HttpHeaderTable& headerTable;
+  const kj::HttpHeaderTable& headerTable;
+  OptimizationLevel peerOptimizationLevel;
   kj::Array<capnp::CommonHeaderName> nameKjToCapnp;
   kj::Array<kj::HttpHeaderId> nameCapnpToKj;
   kj::Array<kj::StringPtr> valueCapnpToKj;
@@ -51,8 +86,11 @@ private:
   class KjToCapnpWebSocketAdapter;
 
   class ClientRequestContextImpl;
+  class ConnectClientRequestContextImpl;
   class KjToCapnpHttpServiceAdapter;
 
+  class HttpServiceResponseImpl;
+  class HttpOverCapnpConnectResponseImpl;
   class ServerRequestContextImpl;
   class CapnpToKjHttpServiceAdapter;
 
@@ -64,3 +102,5 @@ private:
 };
 
 }  // namespace capnp
+
+CAPNP_END_HEADER

@@ -37,7 +37,22 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <atomic>
 #include "mutex.h"
+
+#if KJ_USE_EPOLL
+#include <sys/epoll.h>
+#endif
+
+#if KJ_USE_KQUEUE
+#include <sys/event.h>
+#endif
+
+#if __BIONIC__
+// Android's Bionic defines SIGRTMIN but using it in sigaddset() throws EINVAL, which means we
+// definitely can't actually use RT signals.
+#undef SIGRTMIN
+#endif
 
 namespace kj {
 namespace {
@@ -54,8 +69,6 @@ inline void delay() { usleep(10000); }
 void captureSignals() {
   static bool captured = false;
   if (!captured) {
-    captured = true;
-
     // We use SIGIO and SIGURG as our test signals because they're two signals that we can be
     // reasonably confident won't otherwise be delivered to any KJ or Cap'n Proto test.  We can't
     // use SIGUSR1 because it is reserved by UnixEventPort and SIGUSR2 is used by Valgrind on OSX.
@@ -67,10 +80,72 @@ void captureSignals() {
 #endif
 
     UnixEventPort::captureChildExit();
+
+    captured = true;
   }
 }
 
+#if KJ_USE_EPOLL
+bool qemuBugTestSignalHandlerRan = false;
+void qemuBugTestSignalHandler(int, siginfo_t* siginfo, void*) {
+  qemuBugTestSignalHandlerRan = true;
+}
+
+bool checkForQemuEpollPwaitBug() {
+  // Under qemu-user, when a signal is delivered during epoll_pwait(), the signal successfully
+  // interrupts the wait, but the correct signal handler is not run. This ruins all our tests so
+  // we check for it and skip tests in this case. This does imply UnixEventPort won't be able to
+  // handle signals correctly under qemu-user.
+
+  sigset_t mask;
+  sigset_t origMask;
+  KJ_SYSCALL(sigemptyset(&mask));
+  KJ_SYSCALL(sigaddset(&mask, SIGURG));
+  KJ_SYSCALL(pthread_sigmask(SIG_BLOCK, &mask, &origMask));
+  KJ_DEFER(KJ_SYSCALL(pthread_sigmask(SIG_SETMASK, &origMask, nullptr)));
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_sigaction = &qemuBugTestSignalHandler;
+  action.sa_flags = SA_SIGINFO;
+
+  KJ_SYSCALL(sigfillset(&action.sa_mask));
+  KJ_SYSCALL(sigdelset(&action.sa_mask, SIGBUS));
+  KJ_SYSCALL(sigdelset(&action.sa_mask, SIGFPE));
+  KJ_SYSCALL(sigdelset(&action.sa_mask, SIGILL));
+  KJ_SYSCALL(sigdelset(&action.sa_mask, SIGSEGV));
+
+  KJ_SYSCALL(sigaction(SIGURG, &action, nullptr));
+
+  int efd;
+  KJ_SYSCALL(efd = epoll_create1(EPOLL_CLOEXEC));
+  KJ_DEFER(close(efd));
+
+  kill(getpid(), SIGURG);
+  KJ_ASSERT(!qemuBugTestSignalHandlerRan);
+
+  struct epoll_event event;
+  int n = epoll_pwait(efd, &event, 1, -1, &origMask);
+  KJ_ASSERT(n < 0);
+  KJ_ASSERT(errno == EINTR);
+
+#if !__aarch64__
+  // qemu-user should only be used to execute aarch64 binaries so we should'nt see this bug
+  // elsewhere!
+  KJ_ASSERT(qemuBugTestSignalHandlerRan);
+#endif
+
+  return !qemuBugTestSignalHandlerRan;
+}
+
+const bool BROKEN_QEMU = checkForQemuEpollPwaitBug();
+#else
+const bool BROKEN_QEMU = false;
+#endif
+
 TEST(AsyncUnixTest, Signals) {
+  if (BROKEN_QEMU) return;
+
   captureSignals();
   UnixEventPort port;
   EventLoop loop(port);
@@ -94,7 +169,9 @@ TEST(AsyncUnixTest, SignalWithValue) {
   //
   // Also, this test fails on Linux on mipsel. si_value comes back as zero. No one with a mips
   // machine wants to debug the problem but they demand a patch fixing it, so we disable the test.
-  // Sad. https://github.com/sandstorm-io/capnproto/issues/204
+  // Sad. https://github.com/capnproto/capnproto/issues/204
+
+  if (BROKEN_QEMU) return;
 
   captureSignals();
   UnixEventPort port;
@@ -129,7 +206,9 @@ TEST(AsyncUnixTest, SignalWithPointerValue) {
   //
   // Also, this test fails on Linux on mipsel. si_value comes back as zero. No one with a mips
   // machine wants to debug the problem but they demand a patch fixing it, so we disable the test.
-  // Sad. https://github.com/sandstorm-io/capnproto/issues/204
+  // Sad. https://github.com/capnproto/capnproto/issues/204
+
+  if (BROKEN_QEMU) return;
 
   captureSignals();
   UnixEventPort port;
@@ -156,6 +235,8 @@ TEST(AsyncUnixTest, SignalWithPointerValue) {
 #endif
 
 TEST(AsyncUnixTest, SignalsMultiListen) {
+  if (BROKEN_QEMU) return;
+
   captureSignals();
   UnixEventPort port;
   EventLoop loop(port);
@@ -180,6 +261,8 @@ TEST(AsyncUnixTest, SignalsMultiListen) {
 // platform I'm assuming it's a Cygwin bug.
 
 TEST(AsyncUnixTest, SignalsMultiReceive) {
+  if (BROKEN_QEMU) return;
+
   captureSignals();
   UnixEventPort port;
   EventLoop loop(port);
@@ -200,16 +283,24 @@ TEST(AsyncUnixTest, SignalsMultiReceive) {
 #endif  // !__CYGWIN32__
 
 TEST(AsyncUnixTest, SignalsAsync) {
+  if (BROKEN_QEMU) return;
+
   captureSignals();
   UnixEventPort port;
   EventLoop loop(port);
   WaitScope waitScope(loop);
 
   // Arrange for a signal to be sent from another thread.
-  pthread_t mainThread = pthread_self();
+  pthread_t mainThread KJ_UNUSED = pthread_self();
   Thread thread([&]() {
     delay();
+#if __APPLE__ && KJ_USE_KQUEUE
+    // MacOS kqueue only receives process-level signals and there's nothing much we can do about
+    // that.
+    kill(getpid(), SIGURG);
+#else
     pthread_kill(mainThread, SIGURG);
+#endif
   });
 
   siginfo_t info = port.onSignal(SIGURG).wait(waitScope);
@@ -360,6 +451,32 @@ TEST(AsyncUnixTest, ReadObserverMultiReceive) {
   promise2.wait(waitScope);
 }
 
+TEST(AsyncUnixTest, ReadObserverAndSignals) {
+  // Get FD events while also waiting on a signal. This specifically exercises epoll_pwait() for
+  // FD events on Linux.
+
+  captureSignals();
+  UnixEventPort port;
+  EventLoop loop(port);
+  WaitScope waitScope(loop);
+
+  auto signalPromise = port.onSignal(SIGIO);
+
+  int pipefds[2];
+  KJ_SYSCALL(pipe(pipefds));
+  kj::AutoCloseFd infd(pipefds[0]), outfd(pipefds[1]);
+
+  UnixEventPort::FdObserver observer(port, infd, UnixEventPort::FdObserver::OBSERVE_READ);
+
+  KJ_SYSCALL(write(outfd, "foo", 3));
+
+  observer.whenBecomesReadable().wait(waitScope);
+
+  KJ_EXPECT(!signalPromise.poll(waitScope))
+  kill(getpid(), SIGIO);
+  KJ_EXPECT(signalPromise.poll(waitScope))
+}
+
 TEST(AsyncUnixTest, ReadObserverAsync) {
   captureSignals();
   UnixEventPort port;
@@ -482,8 +599,9 @@ TEST(AsyncUnixTest, WriteObserver) {
   EXPECT_TRUE(writable);
 }
 
-#if !__APPLE__
-// Disabled on macOS due to https://github.com/sandstorm-io/capnproto/issues/374.
+#if !__APPLE__ && !(KJ_USE_KQUEUE && !defined(EVFILT_EXCEPT))
+// Disabled on macOS due to https://github.com/capnproto/capnproto/issues/374.
+// Disabled on kqueue systems that lack EVFILT_EXCEPT because it doesn't work there.
 TEST(AsyncUnixTest, UrgentObserver) {
   // Verify that FdObserver correctly detects availability of out-of-band data.
   // Availability of out-of-band data is implementation-specific.
@@ -722,13 +840,14 @@ TEST(AsyncUnixTest, Wake) {
       port.wake();
     });
 
-    delay();
-    EXPECT_TRUE(port.poll());
+    do {
+      delay();
+    } while (!port.poll());
   }
 }
 
 int exitCodeForSignal = 0;
-void exitSignalHandler(int) {
+[[noreturn]] void exitSignalHandler(int) {
   _exit(exitCodeForSignal);
 }
 
@@ -766,14 +885,13 @@ struct TestChild {
     KJ_SYSCALL(::kill(KJ_REQUIRE_NONNULL(pid), signo));
   }
 
-  KJ_DISALLOW_COPY(TestChild);
+  KJ_DISALLOW_COPY_AND_MOVE(TestChild);
 };
 
 TEST(AsyncUnixTest, ChildProcess) {
+  if (BROKEN_QEMU) return;
+
   captureSignals();
-  UnixEventPort port;
-  EventLoop loop(port);
-  WaitScope waitScope(loop);
 
   // Block SIGTERM so that we can carefully un-block it in children.
   sigset_t sigs, oldsigs;
@@ -781,6 +899,10 @@ TEST(AsyncUnixTest, ChildProcess) {
   KJ_SYSCALL(sigaddset(&sigs, SIGTERM));
   KJ_SYSCALL(pthread_sigmask(SIG_BLOCK, &sigs, &oldsigs));
   KJ_DEFER(KJ_SYSCALL(pthread_sigmask(SIG_SETMASK, &oldsigs, nullptr)) { break; });
+
+  UnixEventPort port;
+  EventLoop loop(port);
+  WaitScope waitScope(loop);
 
   TestChild child1(port, 123);
   KJ_EXPECT(!child1.promise.poll(waitScope));
@@ -856,6 +978,33 @@ KJ_TEST("UnixEventPort whenWriteDisconnected()") {
   hupPromise.wait(waitScope);
 }
 
+KJ_TEST("UnixEventPort FdObserver(..., flags=0)::whenWriteDisconnected()") {
+  // Verifies that given `0' as a `flags' argument,
+  // FdObserver still observes whenWriteDisconnected().
+  //
+  // This can be useful to watch disconnection on a blocking file descriptor.
+  // See discussion: https://github.com/capnproto/capnproto/issues/924
+
+  captureSignals();
+  UnixEventPort port;
+  EventLoop loop(port);
+  WaitScope waitScope(loop);
+
+  int pipefds[2];
+  KJ_SYSCALL(pipe(pipefds));
+  kj::AutoCloseFd infd(pipefds[0]), outfd(pipefds[1]);
+
+  UnixEventPort::FdObserver observer(port, outfd, 0);
+
+  auto hupPromise = observer.whenWriteDisconnected();
+
+  KJ_EXPECT(!hupPromise.poll(waitScope));
+
+  infd = nullptr;
+  KJ_ASSERT(hupPromise.poll(waitScope));
+  hupPromise.wait(waitScope);
+}
+
 #endif
 
 KJ_TEST("UnixEventPort poll for signals") {
@@ -870,8 +1019,8 @@ KJ_TEST("UnixEventPort poll for signals") {
   KJ_EXPECT(!promise1.poll(waitScope));
   KJ_EXPECT(!promise2.poll(waitScope));
 
-  KJ_SYSCALL(raise(SIGURG));
-  KJ_SYSCALL(raise(SIGIO));
+  KJ_SYSCALL(kill(getpid(), SIGURG));
+  KJ_SYSCALL(kill(getpid(), SIGIO));
   port.wake();
 
   KJ_EXPECT(port.poll());
@@ -882,11 +1031,13 @@ KJ_TEST("UnixEventPort poll for signals") {
   promise2.wait(waitScope);
 }
 
-#if defined(SIGRTMIN) && !__CYGWIN__
+#if defined(SIGRTMIN) && !__CYGWIN__ && !__aarch64__
 // TODO(someday): Figure out why RT signals don't seem to work correctly on Cygwin. It looks like
 //   only the first signal is delivered, like how non-RT signals work. Is it possible Cygwin
 //   advertites RT signal support but doesn't actually implement them correctly? I can't find any
 //   information on the internet about this and TBH I don't care about Cygwin enough to dig in.
+// TODO(someday): Figure out why RT signals don't work under qemu-user emulating aarch64 on
+//   Debian Buster.
 
 void testRtSignals(UnixEventPort& port, WaitScope& waitScope, bool doPoll) {
   union sigval value;
@@ -923,6 +1074,48 @@ KJ_TEST("UnixEventPort can receive multiple queued instances of an RT signal") {
   // wait() are very different in how they read signals. (For the poll(2)-based implementation of
   // UnixEventPort, they are indeed pretty different.)
   testRtSignals(port, waitScope, false);
+}
+#endif
+
+#if !(__APPLE__ && KJ_USE_KQUEUE)
+KJ_TEST("UnixEventPort thread-specific signals") {
+  // Verify a signal directed to a thread is only received on the intended thread.
+  //
+  // MacOS kqueue only receives process-level signals and there's nothing much we can do about
+  // that, so this test won't work there.
+
+  if (BROKEN_QEMU) return;
+
+  captureSignals();
+
+  Vector<Own<Thread>> threads;
+  std::atomic<uint> readyCount(0);
+  std::atomic<uint> doneCount(0);
+  for (auto i KJ_UNUSED: kj::zeroTo(16)) {
+    threads.add(kj::heap<Thread>([&]() noexcept {
+      UnixEventPort port;
+      EventLoop loop(port);
+      WaitScope waitScope(loop);
+
+      readyCount.fetch_add(1, std::memory_order_relaxed);
+      port.onSignal(SIGIO).wait(waitScope);
+      doneCount.fetch_add(1, std::memory_order_relaxed);
+    }));
+  }
+
+  do {
+    usleep(1000);
+  } while (readyCount.load(std::memory_order_relaxed) < 16);
+
+  KJ_ASSERT(doneCount.load(std::memory_order_relaxed) == 0);
+
+  uint count = 0;
+  for (uint i: {5, 14, 4, 6, 7, 11, 1, 3, 8, 0, 12, 9, 10, 15, 2, 13}) {
+    threads[i]->sendSignal(SIGIO);
+    threads[i] = nullptr;  // wait for that one thread to exit
+    usleep(1000);
+    KJ_ASSERT(doneCount.load(std::memory_order_relaxed) == ++count);
+  }
 }
 #endif
 

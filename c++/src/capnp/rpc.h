@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include "capability.h"
+#include <capnp/capability.h>
 #include "rpc-prelude.h"
 
 CAPNP_BEGIN_HEADER
@@ -35,6 +35,8 @@ template <typename VatId, typename ProvisionId, typename RecipientId,
 class VatNetwork;
 template <typename SturdyRefObjectId>
 class SturdyRefRestorer;
+
+class MessageReader;
 
 template <typename VatId>
 class BootstrapFactory: public _::BootstrapFactoryBase {
@@ -75,15 +77,13 @@ public:
             typename ThirdPartyCapId, typename JoinResult>
   RpcSystem(
       VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-      kj::Maybe<Capability::Client> bootstrapInterface,
-      kj::Maybe<RealmGateway<>::Client> gateway = nullptr);
+      kj::Maybe<Capability::Client> bootstrapInterface);
 
   template <typename ProvisionId, typename RecipientId,
             typename ThirdPartyCapId, typename JoinResult>
   RpcSystem(
       VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-      BootstrapFactory<VatId>& bootstrapFactory,
-      kj::Maybe<RealmGateway<>::Client> gateway = nullptr);
+      BootstrapFactory<VatId>& bootstrapFactory);
 
   template <typename ProvisionId, typename RecipientId,
             typename ThirdPartyCapId, typename JoinResult,
@@ -141,6 +141,28 @@ public:
   // order to prevent a grain from inundating the system with in-flight calls. In practice, the
   // main time this happens is when a grain is pushing a large file download and doesn't implement
   // proper cooperative flow control.
+
+  // void setTraceEncoder(kj::Function<kj::String(const kj::Exception&)> func);
+  //
+  // (Inherited from _::RpcSystemBase)
+  //
+  // Set a function to call to encode exception stack traces for transmission to remote parties.
+  // By default, traces are not transmitted at all. If a callback is provided, then the returned
+  // string will be sent with the exception. If the remote end is KJ/C++ based, then this trace
+  // text ends up being accessible as kj::Exception::getRemoteTrace().
+  //
+  // Stack traces can sometimes contain sensitive information, so you should think carefully about
+  // what information you are willing to reveal to the remote party.
+
+  kj::Promise<void> run() { return RpcSystemBase::run(); }
+  // Listens for incoming RPC connections and handles them. Never returns normally, but could throw
+  // an exception if the system becomes unable to accept new connections (e.g. because the
+  // underlying listen socket becomes broken somehow).
+  //
+  // For historical reasons, the RpcSystem will actually run itself even if you do not call this.
+  // However, if an exception is thrown, the RpcSystem will log the exception to the console and
+  // then cease accepting new connections. In this case, your server may be in a broken state, but
+  // without restarting. All servers should therefore call run() and handle failures in some way.
 };
 
 template <typename VatId, typename ProvisionId, typename RecipientId,
@@ -161,56 +183,12 @@ RpcSystem<VatId> makeRpcServer(
 // client-server RPC connection.
 
 template <typename VatId, typename ProvisionId, typename RecipientId,
-          typename ThirdPartyCapId, typename JoinResult, typename RealmGatewayClient,
-          typename InternalRef = _::InternalRefFromRealmGatewayClient<RealmGatewayClient>,
-          typename ExternalRef = _::ExternalRefFromRealmGatewayClient<RealmGatewayClient>>
-RpcSystem<VatId> makeRpcServer(
-    VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-    Capability::Client bootstrapInterface, RealmGatewayClient gateway)
-    CAPNP_DEPRECATED("Please transition to using MembranePolicy instead of RealmGateway.");
-// ** DEPRECATED **
-//
-// This uses a RealmGateway to create a membrane between the external network and internal
-// capabilites to translate save() requests. However, MembranePolicy (membrane.h) allows for the
-// creation of much more powerful membranes and doesn't need to be tied to an RpcSystem.
-// Applications should transition to using membranes instead of RealmGateway. RealmGateway will be
-// removed in a future version of Cap'n Proto.
-//
-// Original description:
-//
-// Make an RPC server for a VatNetwork that resides in a different realm from the application.
-// The given RealmGateway is used to translate SturdyRefs between the app's ("internal") format
-// and the network's ("external") format.
-
-template <typename VatId, typename ProvisionId, typename RecipientId,
           typename ThirdPartyCapId, typename JoinResult>
 RpcSystem<VatId> makeRpcServer(
     VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
     BootstrapFactory<VatId>& bootstrapFactory);
 // Make an RPC server that can serve different bootstrap interfaces to different clients via a
 // BootstrapInterface.
-
-template <typename VatId, typename ProvisionId, typename RecipientId,
-          typename ThirdPartyCapId, typename JoinResult, typename RealmGatewayClient,
-          typename InternalRef = _::InternalRefFromRealmGatewayClient<RealmGatewayClient>,
-          typename ExternalRef = _::ExternalRefFromRealmGatewayClient<RealmGatewayClient>>
-RpcSystem<VatId> makeRpcServer(
-    VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-    BootstrapFactory<VatId>& bootstrapFactory, RealmGatewayClient gateway)
-    CAPNP_DEPRECATED("Please transition to using MembranePolicy instead of RealmGateway.");
-// ** DEPRECATED **
-//
-// This uses a RealmGateway to create a membrane between the external network and internal
-// capabilites to translate save() requests. However, MembranePolicy (membrane.h) allows for the
-// creation of much more powerful membranes and doesn't need to be tied to an RpcSystem.
-// Applications should transition to using membranes instead of RealmGateway. RealmGateway will be
-// removed in a future version of Cap'n Proto.
-//
-// Original description:
-//
-// Make an RPC server that can serve different bootstrap interfaces to different clients via a
-// BootstrapInterface and communicates with a different realm than the application is in via a
-// RealmGateway.
 
 template <typename VatId, typename LocalSturdyRefObjectId,
           typename ProvisionId, typename RecipientId, typename ThirdPartyCapId, typename JoinResult>
@@ -246,28 +224,6 @@ RpcSystem<VatId> makeRpcClient(
 //
 // See also ez-rpc.h, which has simpler instructions for the common case of a two-party
 // client-server RPC connection.
-
-template <typename VatId, typename ProvisionId, typename RecipientId,
-          typename ThirdPartyCapId, typename JoinResult, typename RealmGatewayClient,
-          typename InternalRef = _::InternalRefFromRealmGatewayClient<RealmGatewayClient>,
-          typename ExternalRef = _::ExternalRefFromRealmGatewayClient<RealmGatewayClient>>
-RpcSystem<VatId> makeRpcClient(
-    VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-    RealmGatewayClient gateway)
-    CAPNP_DEPRECATED("Please transition to using MembranePolicy instead of RealmGateway.");
-// ** DEPRECATED **
-//
-// This uses a RealmGateway to create a membrane between the external network and internal
-// capabilites to translate save() requests. However, MembranePolicy (membrane.h) allows for the
-// creation of much more powerful membranes and doesn't need to be tied to an RpcSystem.
-// Applications should transition to using membranes instead of RealmGateway. RealmGateway will be
-// removed in a future version of Cap'n Proto.
-//
-// Original description:
-//
-// Make an RPC client for a VatNetwork that resides in a different realm from the application.
-// The given RealmGateway is used to translate SturdyRefs between the app's ("internal") format
-// and the network's ("external") format.
 
 template <typename SturdyRefObjectId>
 class SturdyRefRestorer: public _::SturdyRefRestorerBase {
@@ -339,6 +295,16 @@ public:
   // Get the total size of the message, for flow control purposes. Although the caller could
   // also call getBody().targetSize(), doing that would walk the message tree, whereas typical
   // implementations can compute the size more cheaply by summing segment sizes.
+
+  static bool isShortLivedRpcMessage(AnyPointer::Reader body);
+  // Helper function which computes whether the standard RpcSystem implementation would consider
+  // the given message body to be short-lived, meaning it will be dropped before the next message
+  // is read. This is useful to implement BufferedMessageStream::IsShortLivedCallback.
+
+  static kj::Function<bool(MessageReader&)> getShortLivedCallback();
+  // Returns a function that wraps isShortLivedRpcMessage(). The returned function type matches
+  // `BufferedMessageStream::IsShortLivedCallback` (defined in serialize-async.h), but we don't
+  // include that header here.
 };
 
 class RpcFlowController {
@@ -447,6 +413,10 @@ public:
     // where the bandwidth-delay product is high, while conversely providing too much buffer when
     // the bandwidth-delay product is low.
     //
+    // WARNING: The RPC system may keep the `RpcFlowController` object alive past the lifetime of
+    //   the `Connection` itself. However, it will not call `send()` any more after the
+    //   `Connection` is destroyed.
+    //
     // TODO(perf): We should introduce a flow controller implementation that uses a clock to
     //   measure RTT and bandwidth and dynamically update the window size, like BBR.
 
@@ -463,10 +433,17 @@ public:
     // If `firstSegmentWordSize` is non-zero, it should be treated as a hint suggesting how large
     // to make the first segment.  This is entirely a hint and the connection may adjust it up or
     // down.  If it is zero, the connection should choose the size itself.
+    //
+    // WARNING: The RPC system may keep the `OutgoingRpcMessage` object alive past the lifetime of
+    //   the `Connection` itself. However, it will not call `send()` any more after the
+    //   `Connection` is destroyed.
 
     virtual kj::Promise<kj::Maybe<kj::Own<IncomingRpcMessage>>> receiveIncomingMessage() override = 0;
     // Wait for a message to be received and return it.  If the read stream cleanly terminates,
     // return null.  If any other problem occurs, throw an exception.
+    //
+    // WARNING: The RPC system may keep the `IncomingRpcMessage` object alive past the lifetime of
+    //   the `Connection` itself.
 
     virtual kj::Promise<void> shutdown() override KJ_WARN_UNUSED_RESULT = 0;
     // Waits until all outgoing messages have been sent, then shuts down the outgoing stream. The
@@ -553,18 +530,16 @@ template <typename ProvisionId, typename RecipientId,
           typename ThirdPartyCapId, typename JoinResult>
 RpcSystem<VatId>::RpcSystem(
       VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-      kj::Maybe<Capability::Client> bootstrap,
-      kj::Maybe<RealmGateway<>::Client> gateway)
-    : _::RpcSystemBase(network, kj::mv(bootstrap), kj::mv(gateway)) {}
+      kj::Maybe<Capability::Client> bootstrap)
+    : _::RpcSystemBase(network, kj::mv(bootstrap)) {}
 
 template <typename VatId>
 template <typename ProvisionId, typename RecipientId,
           typename ThirdPartyCapId, typename JoinResult>
 RpcSystem<VatId>::RpcSystem(
       VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-      BootstrapFactory<VatId>& bootstrapFactory,
-      kj::Maybe<RealmGateway<>::Client> gateway)
-    : _::RpcSystemBase(network, bootstrapFactory, kj::mv(gateway)) {}
+      BootstrapFactory<VatId>& bootstrapFactory)
+    : _::RpcSystemBase(network, bootstrapFactory) {}
 
 template <typename VatId>
 template <typename ProvisionId, typename RecipientId,
@@ -600,30 +575,11 @@ RpcSystem<VatId> makeRpcServer(
 }
 
 template <typename VatId, typename ProvisionId, typename RecipientId,
-          typename ThirdPartyCapId, typename JoinResult,
-          typename RealmGatewayClient, typename InternalRef, typename ExternalRef>
-RpcSystem<VatId> makeRpcServer(
-    VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-    Capability::Client bootstrapInterface, RealmGatewayClient gateway) {
-  return RpcSystem<VatId>(network, kj::mv(bootstrapInterface),
-      gateway.template castAs<RealmGateway<>>());
-}
-
-template <typename VatId, typename ProvisionId, typename RecipientId,
           typename ThirdPartyCapId, typename JoinResult>
 RpcSystem<VatId> makeRpcServer(
     VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
     BootstrapFactory<VatId>& bootstrapFactory) {
   return RpcSystem<VatId>(network, bootstrapFactory);
-}
-
-template <typename VatId, typename ProvisionId, typename RecipientId,
-          typename ThirdPartyCapId, typename JoinResult,
-          typename RealmGatewayClient, typename InternalRef, typename ExternalRef>
-RpcSystem<VatId> makeRpcServer(
-    VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-    BootstrapFactory<VatId>& bootstrapFactory, RealmGatewayClient gateway) {
-  return RpcSystem<VatId>(network, bootstrapFactory, gateway.template castAs<RealmGateway<>>());
 }
 
 template <typename VatId, typename LocalSturdyRefObjectId,
@@ -639,15 +595,6 @@ template <typename VatId, typename ProvisionId,
 RpcSystem<VatId> makeRpcClient(
     VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network) {
   return RpcSystem<VatId>(network, nullptr);
-}
-
-template <typename VatId, typename ProvisionId,
-          typename RecipientId, typename ThirdPartyCapId, typename JoinResult,
-          typename RealmGatewayClient, typename InternalRef, typename ExternalRef>
-RpcSystem<VatId> makeRpcClient(
-    VatNetwork<VatId, ProvisionId, RecipientId, ThirdPartyCapId, JoinResult>& network,
-    RealmGatewayClient gateway) {
-  return RpcSystem<VatId>(network, nullptr, gateway.template castAs<RealmGateway<>>());
 }
 
 }  // namespace capnp

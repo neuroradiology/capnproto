@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "time.h"
+#include <kj/time.h>
 #include "async.h"
 
 KJ_BEGIN_HEADER
@@ -36,6 +36,18 @@ class Timer: public MonotonicClock {
   // rate than real time (e.g. a `Timer` could represent CPU time consumed by a thread).  However,
   // all `Timer`s are monotonic: time will never appear to move backwards, even if the calendar
   // date as tracked by the system is manually modified.
+  //
+  // That said, the `Timer` returned by `kj::setupAsyncIo().provider->getTimer()` in particular is
+  // guaranteed to be synchronized with the `MonotonicClock` returned by
+  // `systemPreciseMonotonicClock()` (or, more precisely, is updated to match that clock whenever
+  // the loop waits).
+  //
+  // Note that the value returned by `Timer::now()` only changes each time the
+  // event loop waits for I/O from the system. While the event loop is actively
+  // running, the time stays constant. This is intended to make behavior more
+  // deterministic and reproducible. However, if you need up-to-the-cycle
+  // accurate time, then `Timer::now()` is not appropriate. Instead, use
+  // `systemPreciseMonotonicClock()` directly in this case.
 
 public:
   virtual TimePoint now() const = 0;

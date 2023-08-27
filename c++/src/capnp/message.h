@@ -104,10 +104,6 @@ public:
   virtual kj::ArrayPtr<const word> getSegment(uint id) = 0;
   // Gets the segment with the given ID, or returns null if no such segment exists. This method
   // will be called at most once for each segment ID.
-  //
-  // The returned array must be aligned properly for the host architecture. This means that on
-  // x86/x64, alignment is optional, though recommended for performance, whereas on many other
-  // architectures, alignment is required.
 
   inline const ReaderOptions& getOptions();
   // Get the options passed to the constructor.
@@ -131,7 +127,7 @@ public:
 private:
   ReaderOptions options;
 
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && (defined(__ppc__) || defined(__i386__)))
   static constexpr size_t arenaSpacePadding = 19;
 #else
   static constexpr size_t arenaSpacePadding = 18;
@@ -141,7 +137,7 @@ private:
   // because we don't want clients to have to #include arena.h, which itself includes a bunch of
   // other headers.  We don't use a pointer to a ReaderArena because that would require an
   // extra malloc on every message which could be expensive when processing small messages.
-  void* arenaSpace[arenaSpacePadding + sizeof(kj::MutexGuarded<void*>) / sizeof(void*)];
+  alignas(8) void* arenaSpace[arenaSpacePadding + sizeof(kj::MutexGuarded<void*>) / sizeof(void*)];
   bool allocatedArena;
 
   _::ReaderArena* arena() { return reinterpret_cast<_::ReaderArena*>(arenaSpace); }
@@ -163,7 +159,7 @@ class MessageBuilder {
 public:
   MessageBuilder();
   virtual ~MessageBuilder() noexcept(false);
-  KJ_DISALLOW_COPY(MessageBuilder);
+  KJ_DISALLOW_COPY_AND_MOVE(MessageBuilder);
 
   struct SegmentInit {
     kj::ArrayPtr<word> space;
@@ -204,10 +200,6 @@ public:
   // allocateSegment() is responsible for zeroing the memory before returning. This is required
   // because otherwise the Cap'n Proto implementation would have to zero the memory anyway, and
   // many allocators are able to provide already-zero'd memory more efficiently.
-  //
-  // The returned array must be aligned properly for the host architecture. This means that on
-  // x86/x64, alignment is optional, though recommended for performance, whereas on many other
-  // architectures, alignment is required.
 
   template <typename RootType>
   typename RootType::Builder initRoot();
@@ -249,7 +241,7 @@ public:
   // Add up the allocated space from all segments.
 
 private:
-  void* arenaSpace[22];
+  alignas(8) void* arenaSpace[22];
   // Space in which we can construct a BuilderArena.  We don't use BuilderArena directly here
   // because we don't want clients to have to #include arena.h, which itself includes a bunch of
   // big STL headers.  We don't use a pointer to a BuilderArena because that would require an
@@ -351,7 +343,7 @@ public:
   // Creates a message pointing at the given segment array, without taking ownership of the
   // segments.  All arrays passed in must remain valid until the MessageReader is destroyed.
 
-  KJ_DISALLOW_COPY(SegmentArrayMessageReader);
+  KJ_DISALLOW_COPY_AND_MOVE(SegmentArrayMessageReader);
   ~SegmentArrayMessageReader() noexcept(false);
 
   virtual kj::ArrayPtr<const word> getSegment(uint id) override;
@@ -408,7 +400,7 @@ public:
   // firstSegment MUST be zero-initialized.  MallocMessageBuilder's destructor will write new zeros
   // over any space that was used so that it can be reused.
 
-  KJ_DISALLOW_COPY(MallocMessageBuilder);
+  KJ_DISALLOW_COPY_AND_MOVE(MallocMessageBuilder);
   virtual ~MallocMessageBuilder() noexcept(false);
 
   virtual kj::ArrayPtr<word> allocateSegment(uint minimumSize) override;
@@ -439,7 +431,7 @@ class FlatMessageBuilder: public MessageBuilder {
 
 public:
   explicit FlatMessageBuilder(kj::ArrayPtr<word> array);
-  KJ_DISALLOW_COPY(FlatMessageBuilder);
+  KJ_DISALLOW_COPY_AND_MOVE(FlatMessageBuilder);
   virtual ~FlatMessageBuilder() noexcept(false);
 
   void requireFilled();

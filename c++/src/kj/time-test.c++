@@ -20,7 +20,7 @@
 // THE SOFTWARE.
 
 #if _WIN32
-#define WIN32_LEAN_AND_MEAN 1  // lolz
+#include "win32-api-version.h"
 #endif
 
 #include "time.h"
@@ -37,6 +37,20 @@
 
 namespace kj {
 namespace {
+
+KJ_TEST("stringify times") {
+  KJ_EXPECT(kj::str(50 * kj::SECONDS) == "50s");
+  KJ_EXPECT(kj::str(5 * kj::SECONDS + 2 * kj::MILLISECONDS) == "5.002s");
+  KJ_EXPECT(kj::str(256 * kj::MILLISECONDS) == "256ms");
+  KJ_EXPECT(kj::str(5 * kj::MILLISECONDS + 2 * kj::NANOSECONDS) == "5.000002ms");
+  KJ_EXPECT(kj::str(50 * kj::MICROSECONDS) == "50μs");
+  KJ_EXPECT(kj::str(5 * kj::MICROSECONDS + 300 * kj::NANOSECONDS) == "5.3μs");
+  KJ_EXPECT(kj::str(50 * kj::NANOSECONDS) == "50ns");
+  KJ_EXPECT(kj::str(-256 * kj::MILLISECONDS) == "-256ms");
+  KJ_EXPECT(kj::str(-50 * kj::NANOSECONDS) == "-50ns");
+  KJ_EXPECT(kj::str((int64_t)kj::maxValue * kj::NANOSECONDS) == "9223372036.854775807s");
+  KJ_EXPECT(kj::str((int64_t)kj::minValue * kj::NANOSECONDS) == "-9223372036.854775808s");
+}
 
 #if _WIN32
 void delay(kj::Duration d) {
@@ -76,9 +90,10 @@ KJ_TEST("monotonic clocks match each other") {
   TimePoint p = precise.now();
   TimePoint c = coarse.now();
 
-  // 20ms tolerance due to Windows timeslices being quite long.
-  KJ_EXPECT(p < c + 20 * kj::MILLISECONDS);
-  KJ_EXPECT(p > c - 20 * kj::MILLISECONDS);
+  // 40ms tolerance due to Windows timeslices being quite long, especially on GitHub Actions where
+  // Windows is drunk and has completely lost track of time.
+  KJ_EXPECT(p < c + 40 * kj::MILLISECONDS, p - c);
+  KJ_EXPECT(p > c - 40 * kj::MILLISECONDS, c - p);
 }
 
 KJ_TEST("all clocks advance in real time") {

@@ -1,6 +1,8 @@
 @0x8f5d14e1c273738d;
 
-$import "/capnp/c++.capnp".namespace("capnp");
+using Cxx = import "/capnp/c++.capnp";
+$Cxx.namespace("capnp");
+$Cxx.allowCancellation;
 
 interface ByteStream {
   write @0 (bytes :Data) -> stream;
@@ -8,7 +10,7 @@ interface ByteStream {
 
   end @1 ();
   # Signals clean EOF. (If the ByteStream is dropped without calling this, then the stream was
-  # prematurely canceled and so thet body should not be considered complete.)
+  # prematurely canceled and so the body should not be considered complete.)
 
   getSubstream @2 (callback :SubstreamCallback,
                    limit :UInt64 = 0xffffffffffffffff) -> (substream :ByteStream);
@@ -22,6 +24,10 @@ interface ByteStream {
   #
   # While a substream is active, it is an error to call write() on the original stream. Doing so
   # may throw an exception or may arbitrarily interleave bytes with the substream's writes.
+
+  startTls @3 (expectedServerHostname :Text) -> stream;
+  # Client calls this method when it wants to initiate TLS. This ByteStream is not terminated,
+  # the caller should reuse it.
 
   interface SubstreamCallback {
     ended @0 (byteCount :UInt64);

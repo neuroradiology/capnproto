@@ -1,4 +1,4 @@
-// Copyright (c) 2013-2014 Sandstorm Development Group, Inc. and contributors
+// Copyright (c) 2013-2017 Sandstorm Development Group, Inc. and contributors
 // Licensed under the MIT License:
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -19,7 +19,26 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#if !_WIN32
-#define KJ_USE_PTHREAD_TLS 1
-#include "threadlocal-test.c++"
+#pragma once
+
+// Request Vista-level APIs.
+#ifndef WINVER
+#define WINVER 0x0600
+#elif WINVER < 0x0600
+#error "WINVER defined but older than Vista"
 #endif
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#elif _WIN32_WINNT < 0x0600
+#error "_WIN32_WINNT defined but older than Vista"
+#endif
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN  // ::eyeroll::
+#endif
+
+#define NOSERVICE 1
+#define NOMCX 1
+#define NOIME 1
+#define NOMINMAX 1

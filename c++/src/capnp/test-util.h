@@ -212,6 +212,7 @@ public:
 
   kj::Promise<void> getCap(GetCapContext context) override;
   kj::Promise<void> getAnyCap(GetAnyCapContext context) override;
+  kj::Promise<void> getCapPipelineOnly(GetCapPipelineOnlyContext context) override;
 
 private:
   int& callCount;
@@ -220,6 +221,8 @@ private:
 class TestCallOrderImpl final: public test::TestCallOrder::Server {
 public:
   kj::Promise<void> getCallSequence(GetCallSequenceContext context) override;
+
+  uint getCount() { return count; }
 
 private:
   uint count = 0;
@@ -274,6 +277,10 @@ public:
   kj::Promise<void> getEnormousString(GetEnormousStringContext context) override;
 
   kj::Promise<void> writeToFd(WriteToFdContext context) override;
+
+  kj::Promise<void> throwException(ThrowExceptionContext context) override;
+
+  kj::Promise<void> throwRemoteException(ThrowRemoteExceptionContext context) override;
 
 private:
   int& callCount;
@@ -331,7 +338,6 @@ public:
   }
 
   kj::Promise<void> doStreamJ(DoStreamJContext context) override {
-    context.allowCancellation();
     jSum += context.getParams().getJ();
 
     if (jShouldThrow) {

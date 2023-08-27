@@ -90,12 +90,32 @@ public:
   // some data.
 
 private:
-  volatile uint64_t limit;
-  // Current limit, decremented each time catRead() is called.  Volatile because multiple threads
-  // could be trying to modify it at once.  (This is not real thread-safety, but good enough for
-  // the purpose of this class.  See class comment.)
+  alignas(8) volatile uint64_t limit;
+  // Current limit, decremented each time catRead() is called. We modify this variable using atomics
+  // with "relaxed" thread safety to make TSAN happy (on ARM & x86 this is no different from a
+  // regular read/write of the variable). See the class comment for why this is OK (previously we
+  // used a regular volatile variable - this is just to make ASAN happy).
+  //
+  // alignas(8) is the default on 64-bit systems, but needed on 32-bit to avoid an expensive
+  // unaligned atomic operation.
 
-  KJ_DISALLOW_COPY(ReadLimiter);
+  KJ_DISALLOW_COPY_AND_MOVE(ReadLimiter);
+
+  KJ_ALWAYS_INLINE(void setLimit(uint64_t newLimit)) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&limit, newLimit, __ATOMIC_RELAXED);
+#else
+    limit = newLimit;
+#endif
+  }
+
+  KJ_ALWAYS_INLINE(uint64_t readLimit() const) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __atomic_load_n(&limit, __ATOMIC_RELAXED);
+#else
+    return limit;
+#endif
+  }
 };
 
 #if !CAPNP_LITE
@@ -154,11 +174,11 @@ private:
   kj::ArrayPtr<const word> ptr;  // size guaranteed to fit in SEGMENT_WORD_COUNT_BITS bits
   ReadLimiter* readLimiter;
 
-  KJ_DISALLOW_COPY(SegmentReader);
+  KJ_DISALLOW_COPY_AND_MOVE(SegmentReader);
 
   friend class SegmentBuilder;
 
-  static void abortCheckObjectFault();
+  [[noreturn]] static void abortCheckObjectFault();
   // Called in debug mode in cases that would segfault in opt mode. (Should be impossible!)
 };
 
@@ -204,9 +224,9 @@ private:
 
   bool readOnly;
 
-  void throwNotWritable();
+  [[noreturn]] void throwNotWritable();
 
-  KJ_DISALLOW_COPY(SegmentBuilder);
+  KJ_DISALLOW_COPY_AND_MOVE(SegmentBuilder);
 };
 
 class Arena {
@@ -226,7 +246,7 @@ class ReaderArena final: public Arena {
 public:
   explicit ReaderArena(MessageReader* message);
   ~ReaderArena() noexcept(false);
-  KJ_DISALLOW_COPY(ReaderArena);
+  KJ_DISALLOW_COPY_AND_MOVE(ReaderArena);
 
   size_t sizeInWords();
 
@@ -262,7 +282,7 @@ public:
   explicit BuilderArena(MessageBuilder* message);
   BuilderArena(MessageBuilder* message, kj::ArrayPtr<MessageBuilder::SegmentInit> segments);
   ~BuilderArena() noexcept(false);
-  KJ_DISALLOW_COPY(BuilderArena);
+  KJ_DISALLOW_COPY_AND_MOVE(BuilderArena);
 
   size_t sizeInWords();
 
@@ -328,12 +348,12 @@ private:
   ReadLimiter dummyLimiter;
 
   class LocalCapTable final: public CapTableBuilder {
-#if !CAPNP_LITE
   public:
     kj::Maybe<kj::Own<ClientHook>> extractCap(uint index) override;
     uint injectCap(kj::Own<ClientHook>&& cap) override;
     void dropCap(uint index) override;
 
+#if !CAPNP_LITE
   private:
     kj::Vector<kj::Maybe<kj::Own<ClientHook>>> capTable;
 #endif // ! CAPNP_LITE
@@ -366,17 +386,19 @@ inline ReadLimiter::ReadLimiter()
 
 inline ReadLimiter::ReadLimiter(WordCount64 limit): limit(unbound(limit / WORDS)) {}
 
-inline void ReadLimiter::reset(WordCount64 limit) { this->limit = unbound(limit / WORDS); }
+inline void ReadLimiter::reset(WordCount64 limit) {
+  setLimit(unbound(limit / WORDS));
+}
 
 inline bool ReadLimiter::canRead(WordCount64 amount, Arena* arena) {
   // Be careful not to store an underflowed value into `limit`, even if multiple threads are
   // decrementing it.
-  uint64_t current = limit;
+  uint64_t current = readLimit();
   if (KJ_UNLIKELY(unbound(amount / WORDS) > current)) {
     arena->reportReadLimitReached();
     return false;
   } else {
-    limit = current - unbound(amount / WORDS);
+    setLimit(current - unbound(amount / WORDS));
     return true;
   }
 }

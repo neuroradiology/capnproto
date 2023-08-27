@@ -981,6 +981,14 @@ kj::Promise<void> TestPipelineImpl::getAnyCap(GetAnyCapContext context) {
       });
 }
 
+kj::Promise<void> TestPipelineImpl::getCapPipelineOnly(GetCapPipelineOnlyContext context) {
+  ++callCount;
+  PipelineBuilder<GetCapPipelineOnlyResults> pb;
+  pb.initOutBox().setCap(kj::heap<TestExtendsImpl>(callCount));
+  context.setPipeline(pb.build());
+  return kj::NEVER_DONE;
+}
+
 kj::Promise<void> TestCallOrderImpl::getCallSequence(GetCallSequenceContext context) {
   auto result = context.getResults();
   result.setN(count++);
@@ -1068,7 +1076,6 @@ kj::Promise<void> TestMoreStuffImpl::neverReturn(NeverReturnContext context) {
   // Also attach `cap` to the result struct to make sure that is released.
   context.getResults().setCapCopy(context.getParams().getCap());
 
-  context.allowCancellation();
   return kj::mv(promise);
 }
 
@@ -1111,7 +1118,6 @@ kj::Promise<void> TestMoreStuffImpl::echo(EchoContext context) {
 
 kj::Promise<void> TestMoreStuffImpl::expectCancel(ExpectCancelContext context) {
   auto cap = context.getParams().getCap();
-  context.allowCancellation();
   return loop(0, cap, context);
 }
 
@@ -1121,7 +1127,7 @@ kj::Promise<void> TestMoreStuffImpl::loop(uint depth, test::TestInterface::Clien
     ADD_FAILURE() << "Looped too long, giving up.";
     return kj::READY_NOW;
   } else {
-    return kj::evalLater([this,depth,KJ_CPCAP(cap),KJ_CPCAP(context)]() mutable {
+    return kj::evalLast([this,depth,KJ_CPCAP(cap),KJ_CPCAP(context)]() mutable {
       return loop(depth + 1, cap, context);
     });
   }
@@ -1176,6 +1182,14 @@ kj::Promise<void> TestMoreStuffImpl::writeToFd(WriteToFdContext context) {
   context.getResults().setFdCap3(kj::heap<TestFdCap>(kj::mv(in)));
 
   return kj::joinPromises(promises.finish());
+}
+
+kj::Promise<void> TestMoreStuffImpl::throwException(ThrowExceptionContext context) {
+  return KJ_EXCEPTION(FAILED, "test exception");
+}
+
+kj::Promise<void> TestMoreStuffImpl::throwRemoteException(ThrowRemoteExceptionContext context) {
+  return KJ_EXCEPTION(FAILED, "remote exception: test exception");
 }
 
 #endif  // !CAPNP_LITE

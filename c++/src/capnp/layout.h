@@ -58,9 +58,7 @@ CAPNP_BEGIN_HEADER
 
 namespace capnp {
 
-#if !CAPNP_LITE
 class ClientHook;
-#endif  // !CAPNP_LITE
 
 namespace _ {  // private
 
@@ -312,15 +310,12 @@ inline double unmask<double>(uint64_t value, uint64_t mask) {
 
 class CapTableReader {
 public:
-#if !CAPNP_LITE
   virtual kj::Maybe<kj::Own<ClientHook>> extractCap(uint index) = 0;
   // Extract the capability at the given index.  If the index is invalid, returns null.
-#endif  // !CAPNP_LITE
 };
 
 class CapTableBuilder: public CapTableReader {
 public:
-#if !CAPNP_LITE
   virtual uint injectCap(kj::Own<ClientHook>&& cap) = 0;
   // Add the capability to the message and return its index.  If the same ClientHook is injected
   // twice, this may return the same index both times, but in this case dropCap() needs to be
@@ -328,7 +323,6 @@ public:
 
   virtual void dropCap(uint index) = 0;
   // Remove a capability injected earlier.  Called when the pointer is overwritten or zero'd out.
-#endif  // !CAPNP_LITE
 };
 
 // -------------------------------------------------------------------
@@ -1233,8 +1227,12 @@ inline Void ListReader::getDataElement<Void>(ElementCount index) const {
 }
 
 inline PointerReader ListReader::getPointerElement(ElementCount index) const {
+  // If the list elements have data sections we need to skip those. Note that for pointers to be
+  // present at all (which already must be true if we get here), then `structDataSize` must be a
+  // whole number of words, so we don't have to worry about unaligned reads here.
+  auto offset = structDataSize / BITS_PER_BYTE;
   return PointerReader(segment, capTable, reinterpret_cast<const WirePointer*>(
-      ptr + upgradeBound<uint64_t>(index) * step / BITS_PER_BYTE), nestingLimit);
+      ptr + offset + upgradeBound<uint64_t>(index) * step / BITS_PER_BYTE), nestingLimit);
 }
 
 // -------------------------------------------------------------------

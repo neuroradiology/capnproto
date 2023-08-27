@@ -21,9 +21,7 @@
 // THE SOFTWARE.
 
 #if _WIN32
-#define WIN32_LEAN_AND_MEAN 1  // lolz
-#define WINVER 0x0600
-#define _WIN32_WINNT 0x0600
+#include "win32-api-version.h"
 #endif
 
 #include "time.h"
@@ -72,7 +70,7 @@ class Win32PreciseClock: public Clock {
   typedef VOID WINAPI GetSystemTimePreciseAsFileTimeFunc(LPFILETIME);
 public:
   Date now() const override {
-    static const GetSystemTimePreciseAsFileTimeFunc* getSystemTimePreciseAsFileTimePtr =
+    static GetSystemTimePreciseAsFileTimeFunc* const getSystemTimePreciseAsFileTimePtr =
         getGetSystemTimePreciseAsFileTime();
     FILETIME ft;
     if (getSystemTimePreciseAsFileTimePtr == nullptr) {
@@ -89,6 +87,13 @@ private:
   static GetSystemTimePreciseAsFileTimeFunc* getGetSystemTimePreciseAsFileTime() {
     // Dynamically look up the function GetSystemTimePreciseAsFileTimeFunc(). This was only
     // introduced as of Windows 8, so it might be missing.
+#if __GNUC__ && !__clang__ && __GNUC__ >= 8
+// GCC 8 warns that our reinterpret_cast of a function pointer below is casting between
+// incompatible types. Yes, GCC, we know that. This is the nature of GetProcAddress(); it returns
+// everything as `long long int (*)()` and we have to cast to the actual type.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+#endif
     return reinterpret_cast<GetSystemTimePreciseAsFileTimeFunc*>(GetProcAddress(
       GetModuleHandleA("kernel32.dll"),
       "GetSystemTimePreciseAsFileTime"));
@@ -255,5 +260,62 @@ const MonotonicClock& systemPreciseMonotonicClock() {
 }
 
 #endif
+
+CappedArray<char, _::TIME_STR_LEN> KJ_STRINGIFY(TimePoint t) {
+  return kj::toCharSequence(t - kj::origin<TimePoint>());
+}
+CappedArray<char, _::TIME_STR_LEN> KJ_STRINGIFY(Date d) {
+  return kj::toCharSequence(d - UNIX_EPOCH);
+}
+CappedArray<char, _::TIME_STR_LEN> KJ_STRINGIFY(Duration d) {
+  bool negative = d < 0 * kj::SECONDS;
+  uint64_t ns = d / kj::NANOSECONDS;
+  if (negative) {
+    ns = -ns;
+  }
+
+  auto digits = kj::toCharSequence(ns);
+  ArrayPtr<char> arr = digits;
+
+  size_t point;
+  kj::StringPtr suffix;
+  kj::Duration unit;
+  if (digits.size() > 9) {
+    point = arr.size() - 9;
+    suffix = "s";
+    unit = kj::SECONDS;
+  } else if (digits.size() > 6) {
+    point = arr.size() - 6;
+    suffix = "ms";
+    unit = kj::MILLISECONDS;
+  } else if (digits.size() > 3) {
+    point = arr.size() - 3;
+    suffix = "μs";
+    unit = kj::MICROSECONDS;
+  } else {
+    point = arr.size();
+    suffix = "ns";
+    unit = kj::NANOSECONDS;
+  }
+
+  CappedArray<char, _::TIME_STR_LEN> result;
+  char* begin = result.begin();
+  char* end;
+  if (negative) {
+    *begin++ = '-';
+  }
+  if (d % unit == 0 * kj::NANOSECONDS) {
+    end = _::fillLimited(begin, result.end(), arr.slice(0, point), suffix);
+  } else {
+    while (arr.back() == '0') {
+      arr = arr.slice(0, arr.size() - 1);
+    }
+    KJ_DASSERT(arr.size() > point);
+    end = _::fillLimited(begin, result.end(), arr.slice(0, point), "."_kj,
+        arr.slice(point, arr.size()), suffix);
+  }
+  result.setSize(end - result.begin());
+  return result;
+}
 
 }  // namespace kj

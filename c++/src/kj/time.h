@@ -24,6 +24,7 @@
 
 #include "units.h"
 #include <inttypes.h>
+#include "string.h"
 
 KJ_BEGIN_HEADER
 
@@ -33,6 +34,10 @@ namespace _ {  // private
 class NanosecondLabel;
 class TimeLabel;
 class DateLabel;
+
+static constexpr size_t TIME_STR_LEN = sizeof(int64_t) * 3 + 8;
+// Maximum length of a stringified time. 3 digits per byte of integer, plus 8 digits to cover
+// negative sign, decimal point, unit, NUL terminator, and anything else that might sneak in.
 
 }  // namespace _ (private)
 
@@ -54,6 +59,10 @@ using TimePoint = Absolute<Duration, _::TimeLabel>;
 
 using Date = Absolute<Duration, _::DateLabel>;
 // A point in real-world time, measured relative to the Unix epoch (Jan 1, 1970 00:00:00 UTC).
+
+CappedArray<char, _::TIME_STR_LEN> KJ_STRINGIFY(TimePoint);
+CappedArray<char, _::TIME_STR_LEN> KJ_STRINGIFY(Date);
+CappedArray<char, _::TIME_STR_LEN> KJ_STRINGIFY(Duration);
 
 constexpr Date UNIX_EPOCH = origin<Date>();
 // The `Date` representing Jan 1, 1970 00:00:00 UTC.
@@ -105,7 +114,6 @@ const MonotonicClock& systemPreciseMonotonicClock();
 // The "coarse" version has precision around 1-10ms, while the "precise" version has precision
 // better than 1us. The "precise" version may be slightly slower, though on modern hardware and
 // a reasonable operating system the difference is usually negligible.
-
 }  // namespace kj
 
 KJ_END_HEADER

@@ -104,12 +104,18 @@ KJ_TEST("VectorOutputStream") {
   KJ_ASSERT(kj::str(output.getArray().asChars()) == "abcdefghijklmnopABCD");
 
   output.write(junk + 4, 20);
-  KJ_ASSERT(output.getArray().begin() != buf.begin());
+  // (We can't assert output.getArray().begin() != buf.begin() because the memory allocator could
+  // legitimately have allocated a new array in the same space.)
   KJ_ASSERT(output.getArray().end() != buf3.begin() + 24);
   KJ_ASSERT(kj::str(output.getArray().asChars()) == "abcdefghijklmnopABCDEFGHIJKLMNOPQRSTUVWX");
 
   KJ_ASSERT(output.getWriteBuffer().size() == 24);
   KJ_ASSERT(output.getWriteBuffer().begin() == output.getArray().begin() + 40);
+
+  output.clear();
+  KJ_ASSERT(output.getWriteBuffer().begin() == output.getArray().begin());
+  KJ_ASSERT(output.getWriteBuffer().size() == 64);
+  KJ_ASSERT(output.getArray().size() == 0);
 }
 
 class MockInputStream: public InputStream {
